@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-CIS Benchmark Test Runner
+"""CIS Benchmark Test Runner.
 
 Automates CIS benchmark policy testing against macOS VMs using tart,
 fleetctl, and Fleet's team/MDM infrastructure.
@@ -15,7 +14,6 @@ Dependencies: pyyaml (pip3 install pyyaml)
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -56,7 +54,9 @@ VERSION_MAP = {
     },
 }
 
-SSH_OPTS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS = (
+    "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+)
 VM_USER = "admin"
 VM_PASS = "admin"
 
@@ -165,7 +165,7 @@ def read_fleetctl_config(context: str = "default") -> dict:
     if not config_path.exists():
         return {"address": "", "token": ""}
 
-    with open(config_path) as f:
+    with Path(config_path).open(encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     if not config or "contexts" not in config:
@@ -253,7 +253,7 @@ def parse_policies(yaml_path: Path) -> list[Policy]:
     """Parse the multi-document YAML policy file."""
     policies = []
     missing_cis_id: list[str] = []
-    with open(yaml_path) as f:
+    with Path(yaml_path).open(encoding="utf-8") as f:
         for doc in yaml.safe_load_all(f):
             if not doc or doc.get("kind") != "policy":
                 continue
@@ -274,7 +274,7 @@ def parse_policies(yaml_path: Path) -> list[Policy]:
                     resolution=spec.get("resolution", ""),
                     tags=spec.get("tags", ""),
                     needs_mdm="managed_policies" in query,
-                )
+                ),
             )
     if missing_cis_id:
         # Skip policies without cis_id — without it, the runner can't
@@ -311,7 +311,7 @@ def filter_policies(
 
 def cis_id_sort_key(cis_id: str) -> list[int]:
     """Sort key for CIS IDs like '2.3.3.4' -> [2, 3, 3, 4]."""
-    primary = cis_id.split(",")[0].strip()
+    primary = cis_id.split(",", maxsplit=1)[0].strip()
     parts = []
     for part in primary.split("."):
         try:
@@ -321,7 +321,11 @@ def cis_id_sort_key(cis_id: str) -> list[int]:
     return parts
 
 
-def _discover_profiles(cis_id: str, policy_cis_id: str, profiles_dir: Path) -> list[Path]:
+def _discover_profiles(
+    cis_id: str,
+    policy_cis_id: str,
+    profiles_dir: Path,
+) -> list[Path]:
     """Find all profiles for a CIS ID."""
     if not profiles_dir.exists():
         return []
@@ -343,13 +347,18 @@ def _discover_profiles(cis_id: str, policy_cis_id: str, profiles_dir: Path) -> l
         p = profiles_dir / pattern
         if p.exists() and not p.name.startswith("not_"):
             profiles.append(p)
-    for p in sorted(profiles_dir.glob(f"{cis_id}-part*.mobileconfig")):
-        if not p.name.startswith("not_"):
-            profiles.append(p)
+    profiles.extend(
+        p
+        for p in sorted(profiles_dir.glob(f"{cis_id}-part*.mobileconfig"))
+        if not p.name.startswith("not_")
+    )
     return profiles
 
 
-def _find_enable_disable_profiles(cis_id: str, profiles_dir: Path) -> tuple[Path | None, Path | None]:
+def _find_enable_disable_profiles(
+    cis_id: str,
+    profiles_dir: Path,
+) -> tuple[Path | None, Path | None]:
     """Find the enable and disable profile variants for an org-decision CIS ID."""
     enable = None
     disable = None
@@ -371,11 +380,16 @@ def _policy_stem(name: str) -> str:
     s = name.lower()
     # Strip in order from most specific to least, to avoid partial matches
     for phrase in [
-        "is enabled", "is disabled",
-        "is true", "is false",
-        "enabled", "disabled",
-        "enable", "disable",
-        "true", "false",
+        "is enabled",
+        "is disabled",
+        "is true",
+        "is false",
+        "enabled",
+        "disabled",
+        "enable",
+        "disable",
+        "true",
+        "false",
     ]:
         s = s.replace(phrase, "")
     # Collapse whitespace
@@ -422,6 +436,7 @@ def build_test_plans(
 
     # First pass: group policies by CIS ID to detect org-decision pairs
     from collections import defaultdict
+
     by_cis_id: dict[str, list[Policy]] = defaultdict(list)
     for p in policies:
         by_cis_id[p.cis_id].append(p)
@@ -471,9 +486,7 @@ def build_test_plans(
         # Check for not_always_working variants
         naw_script = scripts_dir / f"not_always_working_CIS_{cis_id}.sh"
         if naw_script.exists() and not pass_only_script.exists():
-            log_verbose(
-                f"Skipping not_always_working script for {cis_id}"
-            )
+            log_verbose(f"Skipping not_always_working script for {cis_id}")
 
         profiles = _discover_profiles(cis_id, policy.cis_id, profiles_dir)
 
@@ -484,14 +497,16 @@ def build_test_plans(
                 continue  # This is the disable variant, skip it
 
             enable_pol, disable_pol = org_decision_pairs[policy.name]
-            enable_prof, disable_prof = _find_enable_disable_profiles(cis_id, profiles_dir)
+            enable_prof, disable_prof = _find_enable_disable_profiles(
+                cis_id,
+                profiles_dir,
+            )
 
             # Non-automatable org-decision pairs fall back to MANUAL.
             if cis_id in non_automatable_ids:
                 test_type = "MANUAL"
                 log_verbose(
-                    f"CIS {cis_id}: forced to MANUAL "
-                    f"({non_automatable_ids[cis_id]})"
+                    f"CIS {cis_id}: forced to MANUAL ({non_automatable_ids[cis_id]})",
                 )
             elif enable_prof or disable_prof:
                 test_type = "ORG_DECISION"
@@ -506,7 +521,7 @@ def build_test_plans(
                     counterpart=disable_pol,
                     enable_profile=enable_prof,
                     disable_profile=disable_prof,
-                )
+                ),
             )
             continue
 
@@ -515,20 +530,17 @@ def build_test_plans(
         # instead.
         if cis_id in ssh_breaking_ids:
             test_type = "MANUAL"
-            log_verbose(
-                f"CIS {cis_id}: forced to MANUAL (script disables SSH)"
-            )
+            log_verbose(f"CIS {cis_id}: forced to MANUAL (script disables SSH)")
         elif cis_id in password_policy_ids:
             test_type = "MANUAL"
             log_verbose(
                 f"CIS {cis_id}: forced to MANUAL "
-                "(password policy profile breaks VM SSH auth)"
+                "(password policy profile breaks VM SSH auth)",
             )
         elif cis_id in non_automatable_ids:
             test_type = "MANUAL"
             log_verbose(
-                f"CIS {cis_id}: forced to MANUAL "
-                f"({non_automatable_ids[cis_id]})"
+                f"CIS {cis_id}: forced to MANUAL ({non_automatable_ids[cis_id]})",
             )
         elif pass_script.exists() and fail_script.exists():
             test_type = "PASS_FAIL"
@@ -549,7 +561,7 @@ def build_test_plans(
                     pass_only_script if pass_only_script.exists() else None
                 ),
                 profiles=profiles,
-            )
+            ),
         )
     return plans
 
@@ -560,7 +572,10 @@ def build_test_plans(
 
 
 def run_cmd(
-    cmd: list[str], timeout: int = 120, check: bool = True, capture: bool = True
+    cmd: list[str],
+    timeout: int = 120,
+    check: bool = True,
+    capture: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run a command, return CompletedProcess."""
     log_verbose(f"$ {' '.join(cmd)}")
@@ -582,7 +597,10 @@ def run_cmd(
         log_error(f"Command failed: {' '.join(cmd)}")
         log_error(f"  {error_detail}")
         raise subprocess.CalledProcessError(
-            result.returncode, cmd, result.stdout, result.stderr
+            result.returncode,
+            cmd,
+            result.stdout,
+            result.stderr,
         )
     return result
 
@@ -590,11 +608,16 @@ def run_cmd(
 def ssh(ip: str, command: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Run a command on the VM via SSH."""
     cmd = [
-        "sshpass", "-p", VM_PASS,
+        "sshpass",
+        "-p",
+        VM_PASS,
         "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
         f"{VM_USER}@{ip}",
         command,
     ]
@@ -604,11 +627,16 @@ def ssh(ip: str, command: str, timeout: int = 120) -> subprocess.CompletedProces
 def scp_to_vm(ip: str, local_path: Path, remote_path: str) -> None:
     """Copy a file to the VM."""
     cmd = [
-        "sshpass", "-p", VM_PASS,
+        "sshpass",
+        "-p",
+        VM_PASS,
         "scp",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
         str(local_path),
         f"{VM_USER}@{ip}:{remote_path}",
     ]
@@ -655,7 +683,11 @@ def fleet_api(
 
 
 def create_fleet_team(
-    fleet_url: str, token: str, fleetctl: str, team_name: str, enroll_secret: str
+    fleet_url: str,
+    token: str,
+    fleetctl: str,
+    team_name: str,
+    enroll_secret: str,
 ) -> FleetTeam:
     """Create a Fleet team via fleetctl apply and return the team info."""
     # Note: "kind: fleet" / "spec.fleet" is the new naming but silently
@@ -668,13 +700,17 @@ def create_fleet_team(
             "team": {
                 "name": team_name,
                 "secrets": [{"secret": enroll_secret}],
-            }
+            },
         },
     }
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yml", delete=False, dir=str(TMP_DIR)
+        encoding="utf-8",
+        mode="w",
+        suffix=".yml",
+        delete=False,
+        dir=str(TMP_DIR),
     ) as f:
         yaml.dump(team_yaml, f)
         tmp_path = f.name
@@ -683,7 +719,7 @@ def create_fleet_team(
         log(f"Creating Fleet team: {team_name}")
         run_cmd([fleetctl, "apply", "-f", tmp_path])
     finally:
-        os.unlink(tmp_path)
+        Path(tmp_path).unlink()
 
     # Get team ID. Try --name filter first, fall back to scanning all.
     team_id = 0
@@ -754,15 +790,19 @@ def push_profiles_to_team(
                 "mdm": {
                     "macos_settings": {
                         "custom_settings": custom_settings,
-                    }
+                    },
                 },
-            }
+            },
         },
     }
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yml", delete=False, dir=str(TMP_DIR)
+        encoding="utf-8",
+        mode="w",
+        suffix=".yml",
+        delete=False,
+        dir=str(TMP_DIR),
     ) as f:
         yaml.dump(team_yaml, f)
         tmp_path = f.name
@@ -771,7 +811,7 @@ def push_profiles_to_team(
         log(f"Pushing {len(unique)} MDM profile(s) to team {team_name}")
         run_cmd([fleetctl, "apply", "-f", tmp_path])
     finally:
-        os.unlink(tmp_path)
+        Path(tmp_path).unlink()
 
 
 def delete_fleet_team(fleet_url: str, token: str, team_id: int) -> None:
@@ -793,13 +833,18 @@ def delete_fleet_host(fleet_url: str, token: str, host_id: int) -> None:
 
 
 def transfer_host_to_team(
-    fleet_url: str, token: str, host_id: int, team_id: int
+    fleet_url: str,
+    token: str,
+    host_id: int,
+    team_id: int,
 ) -> None:
     """Move a host into a specific team."""
     log(f"Transferring host {host_id} to team {team_id}")
     try:
         fleet_api(
-            fleet_url, token, "POST",
+            fleet_url,
+            token,
+            "POST",
             "/api/v1/fleet/hosts/transfer",
             body={"team_id": team_id, "hosts": [host_id]},
         )
@@ -808,15 +853,16 @@ def transfer_host_to_team(
         raise
 
 
-def get_host_by_hostname(
-    fleet_url: str, token: str, hostname: str
-) -> dict | None:
+def get_host_by_hostname(fleet_url: str, token: str, hostname: str) -> dict | None:
     """Look up a host by hostname in Fleet (case-insensitive)."""
     from urllib.parse import quote
 
     target = hostname.lower()
     data = fleet_api(
-        fleet_url, token, "GET", f"/api/v1/fleet/hosts?query={quote(hostname)}"
+        fleet_url,
+        token,
+        "GET",
+        f"/api/v1/fleet/hosts?query={quote(hostname)}",
     )
     if data and data.get("hosts"):
         for host in data["hosts"]:
@@ -837,18 +883,23 @@ def build_fleet_pkg(fleet_url: str, enroll_secret: str, fleetctl: str) -> Path:
         pkg_path.unlink()
 
     log("Building fleet agent package...")
-    run_cmd([
-        fleetctl, "package",
-        "--type=pkg",
-        "--enable-scripts",
-        "--fleet-desktop",
-        "--disable-open-folder",
-        f"--fleet-url={fleet_url}",
-        f"--enroll-secret={enroll_secret}",
-    ], timeout=300)
+    run_cmd(
+        [
+            fleetctl,
+            "package",
+            "--type=pkg",
+            "--enable-scripts",
+            "--fleet-desktop",
+            "--disable-open-folder",
+            f"--fleet-url={fleet_url}",
+            f"--enroll-secret={enroll_secret}",
+        ],
+        timeout=300,
+    )
 
     if not pkg_path.exists():
-        raise RuntimeError("fleetctl package did not produce fleet-osquery.pkg")
+        msg = "fleetctl package did not produce fleet-osquery.pkg"
+        raise RuntimeError(msg)
 
     log(f"Package built: {pkg_path}")
     return pkg_path
@@ -885,12 +936,11 @@ def create_vm(name: str, image: str) -> None:
 
 def start_vm(name: str) -> subprocess.Popen:
     log(f"Starting VM {name}...")
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         ["tart", "run", name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return proc
 
 
 def wait_for_ip(name: str, timeout: int = 180) -> str:
@@ -903,7 +953,8 @@ def wait_for_ip(name: str, timeout: int = 180) -> str:
             log(f"VM IP: {ip}")
             return ip
         time.sleep(3)
-    raise TimeoutError(f"VM {name} did not get an IP within {timeout}s")
+    msg = f"VM {name} did not get an IP within {timeout}s"
+    raise TimeoutError(msg)
 
 
 def wait_for_ssh(ip: str, timeout: int = 120) -> None:
@@ -915,7 +966,8 @@ def wait_for_ssh(ip: str, timeout: int = 120) -> None:
             log("SSH is ready")
             return
         time.sleep(3)
-    raise TimeoutError(f"SSH not available on {ip} within {timeout}s")
+    msg = f"SSH not available on {ip} within {timeout}s"
+    raise TimeoutError(msg)
 
 
 def stop_vm(name: str) -> None:
@@ -945,7 +997,8 @@ def install_agent(ip: str, pkg_path: Path) -> None:
         timeout=120,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Agent install failed: {result.stderr}")
+        msg = f"Agent install failed: {result.stderr}"
+        raise RuntimeError(msg)
 
 
 def wait_for_identifier(ip: str, timeout: int = 120) -> str:
@@ -959,11 +1012,14 @@ def wait_for_identifier(ip: str, timeout: int = 120) -> str:
             log(f"Orbit identifier: {identifier}")
             return identifier
         time.sleep(5)
-    raise TimeoutError("Orbit identifier did not appear")
+    msg = "Orbit identifier did not appear"
+    raise TimeoutError(msg)
 
 
 def wait_for_fleet_registration(
-    fleet_url: str, identifier: str, timeout: int = 120
+    fleet_url: str,
+    identifier: str,
+    timeout: int = 120,
 ) -> None:
     """Poll until the host is registered in Fleet."""
     log("Waiting for Fleet registration...")
@@ -979,14 +1035,16 @@ def wait_for_fleet_registration(
         except (HTTPError, URLError):
             pass
         time.sleep(5)
-    raise TimeoutError("Host did not register in Fleet")
+    msg = "Host did not register in Fleet"
+    raise TimeoutError(msg)
 
 
 def get_hostname(ip: str) -> str:
     """Get the VM's hostname via SSH."""
     result = ssh(ip, "hostname", timeout=10)
     if result.returncode != 0:
-        raise RuntimeError("Could not get hostname from VM")
+        msg = "Could not get hostname from VM"
+        raise RuntimeError(msg)
     return result.stdout.strip()
 
 
@@ -1010,7 +1068,8 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
         with urlopen(req, timeout=30) as resp:
             content = resp.read()
     except (HTTPError, URLError) as e:
-        raise RuntimeError(f"Failed to fetch MDM enrollment profile: {e}")
+        msg = f"Failed to fetch MDM enrollment profile: {e}"
+        raise RuntimeError(msg)
 
     # The device API may return:
     # a) An actual mobileconfig (legacy)
@@ -1026,13 +1085,15 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
 
         if enroll_url:
             # Extract enroll_secret from the URL and build OTA URL
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
+
             parsed = urlparse(enroll_url)
             qs = parse_qs(parsed.query)
             enroll_secret = qs.get("enroll_secret", [""])[0]
             if not enroll_secret:
+                msg = f"Could not extract enroll_secret from: {enroll_url}"
                 raise RuntimeError(
-                    f"Could not extract enroll_secret from: {enroll_url}"
+                    msg,
                 )
 
             ota_url = (
@@ -1045,17 +1106,23 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
                 with urlopen(req, timeout=30) as resp:
                     content = resp.read()
             except (HTTPError, URLError) as e:
-                raise RuntimeError(
+                msg = (
                     f"Failed to fetch OTA enrollment profile: {e}. "
                     "Ensure Apple MDM is configured on the Fleet server."
                 )
+                raise RuntimeError(
+                    msg,
+                )
 
     if b"<?xml" not in content and b"plist" not in content:
-        raise RuntimeError(
+        msg = (
             "Fleet returned an invalid MDM enrollment profile. "
             "Ensure Apple MDM is fully configured on the Fleet server "
             "(APNs certificate, SCEP). Without MDM, profile-based "
             "CIS policies cannot be tested."
+        )
+        raise RuntimeError(
+            msg,
         )
 
     # Write to temp file, SCP to VM, open
@@ -1121,13 +1188,12 @@ def wait_for_query_pass(
     return False
 
 
-def run_query(
-    query: str, hostname: str, fleetctl: str, timeout: int = 60
-) -> bool:
+def run_query(query: str, hostname: str, fleetctl: str, timeout: int = 60) -> bool:
     """Run a policy query via fleetctl. Returns True if query returns rows."""
     result = run_cmd(
         [
-            fleetctl, "query",
+            fleetctl,
+            "query",
             f"--query={query}",
             f"--hosts={hostname}",
             "--exit",
@@ -1139,7 +1205,8 @@ def run_query(
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() or "(no output)"
-        raise RuntimeError(f"fleetctl query failed: {detail}")
+        msg = f"fleetctl query failed: {detail}"
+        raise RuntimeError(msg)
 
     stdout = result.stdout or ""
     # fleetctl query outputs one JSON object per line per host:
@@ -1187,8 +1254,9 @@ def run_script_on_vm(ip: str, script_path: Path) -> subprocess.CompletedProcess:
     log_verbose(f"Script exit code: {result.returncode}")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() or "(no output)"
+        msg = f"Script {script_path.name} failed (exit {result.returncode}): {detail}"
         raise RuntimeError(
-            f"Script {script_path.name} failed (exit {result.returncode}): {detail}"
+            msg,
         )
     return result
 
@@ -1209,7 +1277,9 @@ def prompt_manual(policy: Policy) -> bool:
     for line in policy.resolution.strip().splitlines():
         print(f"  {line}")
     print()
-    response = input("Apply the remediation above in the VM, then press Enter (or type 'skip'): ")
+    response = input(
+        "Apply the remediation above in the VM, then press Enter (or type 'skip'): ",
+    )
     return response.strip().lower() != "skip"
 
 
@@ -1251,19 +1321,32 @@ def run_test(
                 # Step 1: remove profile → query should poll to False
                 log_verbose("Removing profile via MDM...")
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name, other_profiles
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
+                    other_profiles,
                 )
                 if not wait_for_query_pass(
-                    policy.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=mdm_deadline, expected=False,
+                    policy.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=mdm_deadline,
+                    expected=False,
                 ):
                     # Restore before returning
                     push_profiles_to_team(
-                        fleet_url, fleet_token, fleetctl, team_name,
+                        fleet_url,
+                        fleet_token,
+                        fleetctl,
+                        team_name,
                         other_profiles + list(plan.profiles),
                     )
                     return TestResult(
-                        cis_id, name, "FAIL",
+                        cis_id,
+                        name,
+                        "FAIL",
                         "Query still passed after removing MDM profile "
                         f"(waited {mdm_deadline}s)",
                     )
@@ -1271,15 +1354,24 @@ def run_test(
                 # Step 2: re-install profile → query should poll to True
                 log_verbose("Re-pushing profile via MDM...")
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name,
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
                     other_profiles + list(plan.profiles),
                 )
                 if not wait_for_query_pass(
-                    policy.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=mdm_deadline, expected=True,
+                    policy.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=mdm_deadline,
+                    expected=True,
                 ):
                     return TestResult(
-                        cis_id, name, "FAIL",
+                        cis_id,
+                        name,
+                        "FAIL",
                         "Query did not pass after re-pushing MDM profile "
                         f"(waited {mdm_deadline}s)",
                     )
@@ -1291,7 +1383,9 @@ def run_test(
             time.sleep(5)
             if run_query(policy.query, hostname, fleetctl, query_timeout):
                 return TestResult(
-                    cis_id, name, "FAIL",
+                    cis_id,
+                    name,
+                    "FAIL",
                     "Expected query to fail after fail script, but it returned rows",
                 )
 
@@ -1300,33 +1394,35 @@ def run_test(
             time.sleep(5)
             if not run_query(policy.query, hostname, fleetctl, query_timeout):
                 return TestResult(
-                    cis_id, name, "FAIL",
+                    cis_id,
+                    name,
+                    "FAIL",
                     "Expected query to pass after pass script, but it returned no rows",
                 )
 
             return TestResult(cis_id, name, "PASS")
 
-        elif plan.test_type == "PASS_ONLY":
+        if plan.test_type == "PASS_ONLY":
             log_verbose("Running pass-only script...")
             run_script_on_vm(ip, plan.pass_only_script)
             time.sleep(5)
             if not run_query(policy.query, hostname, fleetctl, query_timeout):
                 return TestResult(
-                    cis_id, name, "FAIL",
+                    cis_id,
+                    name,
+                    "FAIL",
                     "Query returned no rows after running pass script",
                 )
             return TestResult(cis_id, name, "PASS")
 
-        elif plan.test_type == "PROFILE":
+        if plan.test_type == "PROFILE":
             # Profile-only test. Profiles were pushed in Phase 5.
             # The post-profile query must pass. A pre-profile "passed"
             # state (captured in Phase 5 before profiles were pushed)
             # is noted as a warning in the details but does not fail
             # the test — some queries check OS state (firewall,
             # gatekeeper) that may be compliant regardless of profile.
-            log_verbose(
-                f"Profile(s) pushed: {[p.name for p in plan.profiles]}"
-            )
+            log_verbose(f"Profile(s) pushed: {[p.name for p in plan.profiles]}")
 
             details = ""
             if pre_profile_passed and cis_id in pre_profile_passed:
@@ -1337,16 +1433,16 @@ def run_test(
 
             # Poll instead of checking once — MDM delivery time varies
             # and the fixed 30s wait in Phase 5 isn't always enough.
-            if not wait_for_query_pass(
-                policy.query, hostname, fleetctl, query_timeout
-            ):
+            if not wait_for_query_pass(policy.query, hostname, fleetctl, query_timeout):
                 return TestResult(
-                    cis_id, name, "FAIL",
+                    cis_id,
+                    name,
+                    "FAIL",
                     "Query returned no rows after MDM profile delivery",
                 )
             return TestResult(cis_id, name, "PASS", details)
 
-        elif plan.test_type == "ORG_DECISION":
+        if plan.test_type == "ORG_DECISION":
             # Org-decision pair: two contradicting policies share the
             # same CIS ID (e.g., iCloud Drive enabled vs disabled).
             # Test both directions using enable/disable profiles.
@@ -1359,7 +1455,7 @@ def run_test(
             log_verbose(
                 f"Org-decision pair: "
                 f"enable={enable_prof.name if enable_prof else 'none'}, "
-                f"disable={disable_prof.name if disable_prof else 'none'}"
+                f"disable={disable_prof.name if disable_prof else 'none'}",
             )
 
             failures = []
@@ -1372,47 +1468,61 @@ def run_test(
             if enable_prof:
                 log_verbose("Pushing enable profile + base profiles...")
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name,
-                    other_profiles + [enable_prof],
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
+                    [*other_profiles, enable_prof],
                 )
 
                 if not wait_for_query_pass(
-                    enable_pol.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=org_deadline, expected=True,
+                    enable_pol.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=org_deadline,
+                    expected=True,
                 ):
-                    failures.append(
-                        "Enable policy did not pass after enable profile"
-                    )
+                    failures.append("Enable policy did not pass after enable profile")
                 if disable_pol and not wait_for_query_pass(
-                    disable_pol.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=org_deadline, expected=False,
+                    disable_pol.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=org_deadline,
+                    expected=False,
                 ):
-                    failures.append(
-                        "Disable policy still passes after enable profile"
-                    )
+                    failures.append("Disable policy still passes after enable profile")
 
             # Step 2: Push disable profile, poll: disable passes + enable fails
             if disable_prof:
                 log_verbose("Pushing disable profile + base profiles...")
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name,
-                    other_profiles + [disable_prof],
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
+                    [*other_profiles, disable_prof],
                 )
 
                 if disable_pol and not wait_for_query_pass(
-                    disable_pol.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=org_deadline, expected=True,
+                    disable_pol.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=org_deadline,
+                    expected=True,
                 ):
-                    failures.append(
-                        "Disable policy did not pass after disable profile"
-                    )
+                    failures.append("Disable policy did not pass after disable profile")
                 if not wait_for_query_pass(
-                    enable_pol.query, hostname, fleetctl, query_timeout,
-                    deadline_seconds=org_deadline, expected=False,
+                    enable_pol.query,
+                    hostname,
+                    fleetctl,
+                    query_timeout,
+                    deadline_seconds=org_deadline,
+                    expected=False,
                 ):
-                    failures.append(
-                        "Enable policy still passes after disable profile"
-                    )
+                    failures.append("Enable policy still passes after disable profile")
 
             # Restore base profiles without any org-decision profile.
             # No polling here — no assertion about the resulting state,
@@ -1420,25 +1530,33 @@ def run_test(
             if other_profiles:
                 log_verbose("Restoring base profiles...")
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name,
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
                     other_profiles,
                 )
                 time.sleep(15)
 
             if failures:
                 return TestResult(
-                    cis_id, name, "FAIL", "; ".join(failures),
+                    cis_id,
+                    name,
+                    "FAIL",
+                    "; ".join(failures),
                 )
             return TestResult(cis_id, name, "PASS")
 
-        elif plan.test_type == "MANUAL":
+        if plan.test_type == "MANUAL":
             applied = prompt_manual(policy)
             if not applied:
                 return TestResult(cis_id, name, "SKIP", "User skipped")
             time.sleep(5)
             if not run_query(policy.query, hostname, fleetctl, query_timeout):
                 return TestResult(
-                    cis_id, name, "FAIL",
+                    cis_id,
+                    name,
+                    "FAIL",
                     "Query returned no rows after manual remediation",
                 )
             return TestResult(cis_id, name, "PASS")
@@ -1475,7 +1593,7 @@ def print_summary(results: list[TestResult], team: FleetTeam) -> int:
         f"Pass: {len(passed)}  "
         f"Fail: {len(failed)}  "
         f"Skip: {len(skipped)}  "
-        f"Error: {len(errors)}"
+        f"Error: {len(errors)}",
     )
 
     if failed:
@@ -1806,9 +1924,7 @@ def main() -> int:
     fleetctl_config = read_fleetctl_config(args.fleetctl_context)
 
     fleet_url = (
-        args.fleet_url
-        or os.environ.get("FLEET_URL", "")
-        or fleetctl_config["address"]
+        args.fleet_url or os.environ.get("FLEET_URL", "") or fleetctl_config["address"]
     ).rstrip("/")
 
     fleet_token = (
@@ -1820,20 +1936,20 @@ def main() -> int:
     if not fleet_url:
         log_error(
             "Fleet URL not found. Provide --fleet-url, set $FLEET_URL, "
-            "or log in with: fleetctl login"
+            "or log in with: fleetctl login",
         )
         return 1
     if not fleet_token:
         log_error(
             "Fleet API token not found. Provide --fleet-token, set "
-            "$FLEET_API_TOKEN, or log in with: fleetctl login"
+            "$FLEET_API_TOKEN, or log in with: fleetctl login",
         )
         return 1
 
     log(f"Using Fleet server: {fleet_url}")
     if fleet_url == fleetctl_config["address"] and not args.fleet_url:
         log_verbose(
-            f"(credentials from fleetctl config, context: {args.fleetctl_context})"
+            f"(credentials from fleetctl config, context: {args.fleetctl_context})",
         )
 
     fleetctl = args.fleetctl_path
@@ -1850,7 +1966,7 @@ def main() -> int:
         if status == 401:
             log_error(
                 "Fleet API token is invalid or expired. "
-                "Please re-authenticate with: fleetctl login"
+                "Please re-authenticate with: fleetctl login",
             )
         else:
             log_error(f"Cannot reach Fleet server at {fleet_url}: {e}")
@@ -1858,7 +1974,11 @@ def main() -> int:
 
     # Resolve CIS directory
     repo_root = Path(__file__).resolve().parent.parent.parent
-    cis_dir = Path(args.cis_dir) if args.cis_dir else repo_root / "ee" / "cis" / version_info["dir"]
+    cis_dir = (
+        Path(args.cis_dir)
+        if args.cis_dir
+        else repo_root / "ee" / "cis" / version_info["dir"]
+    )
     yaml_path = cis_dir / "cis-policy-queries.yml"
     scripts_dir = cis_dir / "test" / "scripts"
     profiles_dir = cis_dir / "test" / "profiles"
@@ -1894,7 +2014,9 @@ def main() -> int:
     password_policy = PASSWORD_POLICY_CIS_IDS.get(args.macos_version, set())
     non_automatable = NON_AUTOMATABLE_CIS_IDS.get(args.macos_version, {})
     plans = build_test_plans(
-        policies, scripts_dir, profiles_dir,
+        policies,
+        scripts_dir,
+        profiles_dir,
         ssh_breaking_ids=ssh_breaking,
         password_policy_ids=password_policy,
         non_automatable_ids=non_automatable,
@@ -1925,7 +2047,7 @@ def main() -> int:
                     plan.policy.name,
                     "SKIP",
                     f"{plan.test_type} excluded by {skip_reason}",
-                )
+                ),
             )
         elif args.only_scripts and (plan.policy.needs_mdm or plan.profiles):
             # --only-scripts should exclude anything requiring MDM,
@@ -1937,7 +2059,7 @@ def main() -> int:
                     plan.policy.name,
                     "SKIP",
                     "requires MDM, excluded by --only-scripts",
-                )
+                ),
             )
         elif plan.test_type == "MANUAL" and args.skip_manual:
             skip_results.append(
@@ -1946,21 +2068,17 @@ def main() -> int:
                     plan.policy.name,
                     "SKIP",
                     "manual test (--skip-manual)",
-                )
+                ),
             )
         else:
             active_plans.append(plan)
 
     any_needs_mdm = any(
-        p.policy.needs_mdm
-        or p.test_type == "PROFILE"
-        or p.test_type == "ORG_DECISION"
+        p.policy.needs_mdm or p.test_type in {"PROFILE", "ORG_DECISION"}
         for p in active_plans
     )
 
-    log(
-        f"Test plans: {len(active_plans)} active, {len(skip_results)} skipped"
-    )
+    log(f"Test plans: {len(active_plans)} active, {len(skip_results)} skipped")
     if any_needs_mdm:
         log("Some policies require MDM — will prompt for MDM enrollment")
 
@@ -2003,7 +2121,7 @@ def main() -> int:
             except TimeoutError:
                 log(
                     "SSH unreachable on existing VM (a previous test "
-                    "may have disabled it). Recreating VM..."
+                    "may have disabled it). Recreating VM...",
                 )
                 delete_vm(vm_name)
                 # Fall through to the fresh-VM path below
@@ -2020,7 +2138,11 @@ def main() -> int:
                 # Check if the agent is installed and the host is in Fleet
                 result = ssh(ip, "cat /opt/orbit/identifier 2>/dev/null", timeout=10)
                 has_identifier = result.returncode == 0 and result.stdout.strip()
-                host_info = get_host_by_hostname(fleet_url, fleet_token, hostname) if has_identifier else None
+                host_info = (
+                    get_host_by_hostname(fleet_url, fleet_token, hostname)
+                    if has_identifier
+                    else None
+                )
 
                 if host_info:
                     identifier = result.stdout.strip()
@@ -2031,7 +2153,7 @@ def main() -> int:
                 else:
                     log(
                         "Host not found in Fleet — will re-install agent "
-                        "to enroll in the test team"
+                        "to enroll in the test team",
                     )
 
         if not reused_vm:
@@ -2045,7 +2167,7 @@ def main() -> int:
                     "WARNING: Using pre-built package. The VM will enroll "
                     "with whatever secret was baked into this package, which "
                     "may not match the test team. If the host does not appear "
-                    "in the test team, rebuild without --pkg-path."
+                    "in the test team, rebuild without --pkg-path.",
                 )
             else:
                 pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
@@ -2066,16 +2188,19 @@ def main() -> int:
             if not reused_vm:
                 # pkg already built above for fresh VMs
                 pass
+            # Reused VM needs a new agent to enroll in the test team
+            elif args.pkg_path:
+                pkg_path = Path(args.pkg_path)
             else:
-                # Reused VM needs a new agent to enroll in the test team
-                if args.pkg_path:
-                    pkg_path = Path(args.pkg_path)
-                else:
-                    pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
+                pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
 
             install_agent(ip, pkg_path)
             identifier = wait_for_identifier(ip, timeout=args.boot_timeout)
-            wait_for_fleet_registration(fleet_url, identifier, timeout=args.boot_timeout)
+            wait_for_fleet_registration(
+                fleet_url,
+                identifier,
+                timeout=args.boot_timeout,
+            )
 
             # Look up host ID in Fleet
             time.sleep(10)  # Give Fleet a moment to index the host
@@ -2098,17 +2223,19 @@ def main() -> int:
                     current = f"team {host_team_id}" if host_team_id else "no team"
                     log(
                         f"Host is in {current}, expected {team.team_id} "
-                        f"({team.name}). Transferring..."
+                        f"({team.name}). Transferring...",
                     )
                     try:
                         transfer_host_to_team(
-                            fleet_url, fleet_token, team.host_id, team.team_id
+                            fleet_url,
+                            fleet_token,
+                            team.host_id,
+                            team.team_id,
                         )
                         log(f"Host transferred to team {team.team_id}")
                     except HTTPError:
                         log_error(
-                            "Failed to transfer host. Profile-based "
-                            "tests will fail."
+                            "Failed to transfer host. Profile-based tests will fail.",
                         )
 
         # Phase 5: MDM enrollment and profile delivery
@@ -2131,13 +2258,12 @@ def main() -> int:
                     already_mdm = True
                     log(
                         f"Host already MDM-enrolled ({mdm_status}), "
-                        "skipping MDM enrollment prompt"
+                        "skipping MDM enrollment prompt",
                     )
                     break
                 if attempt < 5:
                     log_verbose(
-                        f"MDM status check {attempt + 1}/6: "
-                        f"{mdm_status!r}, retrying..."
+                        f"MDM status check {attempt + 1}/6: {mdm_status!r}, retrying...",
                     )
                     time.sleep(5)
 
@@ -2157,23 +2283,30 @@ def main() -> int:
             pre_profile_passed = set()
             if profile_plans:
                 log("Clearing team profiles to get a clean baseline...")
-                push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name, []
-                )
+                push_profiles_to_team(fleet_url, fleet_token, fleetctl, team_name, [])
                 time.sleep(20)  # Wait for the host to process removal
 
-                log(f"Verifying {len(profile_plans)} profile-only queries fail before delivery...")
+                log(
+                    f"Verifying {len(profile_plans)} profile-only queries fail before delivery...",
+                )
                 for plan in profile_plans:
-                    passes = run_query(plan.policy.query, hostname, fleetctl, args.query_timeout)
+                    passes = run_query(
+                        plan.policy.query,
+                        hostname,
+                        fleetctl,
+                        args.query_timeout,
+                    )
                     if passes:
                         pre_profile_passed.add(plan.policy.cis_id)
-                        log(f"  [!] CIS {plan.policy.cis_id}: already passes (may not detect non-compliance)")
+                        log(
+                            f"  [!] CIS {plan.policy.cis_id}: already passes (may not detect non-compliance)",
+                        )
                     else:
                         log(f"  [ok] CIS {plan.policy.cis_id}: fails as expected")
                 log(
                     f"Pre-profile check complete: "
                     f"{len(profile_plans) - len(pre_profile_passed)} fail as expected, "
-                    f"{len(pre_profile_passed)} already pass"
+                    f"{len(pre_profile_passed)} already pass",
                 )
 
             # Collect profiles needed by PROFILE plans (tested by
@@ -2192,7 +2325,11 @@ def main() -> int:
             for plan in active_plans:
                 if plan.test_type == "ORG_DECISION":
                     continue
-                if plan.test_type == "PASS_FAIL" and plan.policy.needs_mdm and plan.profiles:
+                if (
+                    plan.test_type == "PASS_FAIL"
+                    and plan.policy.needs_mdm
+                    and plan.profiles
+                ):
                     continue
                 if plan.test_type == "MANUAL":
                     continue
@@ -2200,7 +2337,11 @@ def main() -> int:
             base_profiles = list({str(p): p for p in all_profiles}.values())
             if base_profiles:
                 push_profiles_to_team(
-                    fleet_url, fleet_token, fleetctl, team_name, base_profiles
+                    fleet_url,
+                    fleet_token,
+                    fleetctl,
+                    team_name,
+                    base_profiles,
                 )
                 log("Waiting for profiles to be delivered...")
                 time.sleep(30)
@@ -2211,7 +2352,11 @@ def main() -> int:
         log(f"Running {len(active_plans)} test(s)...")
         for plan in active_plans:
             result = run_test(
-                plan, ip, hostname, fleetctl, args.query_timeout,
+                plan,
+                ip,
+                hostname,
+                fleetctl,
+                args.query_timeout,
                 pre_profile_passed=pre_profile_passed,
                 fleet_url=fleet_url,
                 fleet_token=fleet_token,
@@ -2219,11 +2364,11 @@ def main() -> int:
                 base_profiles=base_profiles,
             )
             results.append(result)
-            status_symbol = {
-                "PASS": "+", "FAIL": "x", "SKIP": "-", "ERROR": "!"
-            }.get(result.status, "?")
+            status_symbol = {"PASS": "+", "FAIL": "x", "SKIP": "-", "ERROR": "!"}.get(
+                result.status,
+                "?",
+            )
             log(f"  [{status_symbol}] CIS {result.cis_id}: {result.status}")
-
 
     except KeyboardInterrupt:
         log("\nInterrupted by user")
@@ -2232,6 +2377,7 @@ def main() -> int:
         log_error(f"Fatal error: {e}")
         if VERBOSE:
             import traceback
+
             traceback.print_exc()
         fatal_exit_code = 1
     finally:

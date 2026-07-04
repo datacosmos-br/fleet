@@ -8,10 +8,10 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 
-def run_terraform_output(directory: Path) -> Dict[str, Any]:
+def run_terraform_output(directory: Path) -> dict[str, Any]:
     """Return the parsed JSON from `terraform output -json` in `directory`."""
     try:
         proc = subprocess.run(
@@ -34,11 +34,14 @@ def run_terraform_output(directory: Path) -> Dict[str, Any]:
     try:
         return json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
-        print(f"failed to parse terraform output JSON in {directory}: {exc}", file=sys.stderr)
+        print(
+            f"failed to parse terraform output JSON in {directory}: {exc}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
-def summarize_databases(databases: Dict[str, Any]) -> str:
+def summarize_databases(databases: dict[str, Any]) -> str:
     """Format the database information."""
     lines: list[str] = []
     if not databases:
@@ -61,8 +64,10 @@ def summarize_databases(databases: Dict[str, Any]) -> str:
             lines.append(f"  Cluster endpoint: {cluster_endpoint}")
         if reader_endpoint and reader_endpoint != cluster_endpoint:
             lines.append(f"  Reader endpoint:  {reader_endpoint}")
-        lines.append(f"  Engine version:   {engine}")
-        lines.append(f"  Database name:    {db_name}")
+        lines.extend((
+            f"  Engine version:   {engine}",
+            f"  Database name:    {db_name}",
+        ))
 
         instances = details.get("cluster_instances") or {}
         if instances:
@@ -73,14 +78,16 @@ def summarize_databases(databases: Dict[str, Any]) -> str:
                 instance_class = instance.get("instance_class") or "unknown"
                 is_writer = instance.get("writer")
                 role = "writer" if is_writer else "reader"
-                lines.append(f"    - {instance_name} ({role}) @ {endpoint} [{instance_class}]")
+                lines.append(
+                    f"    - {instance_name} ({role}) @ {endpoint} [{instance_class}]",
+                )
 
         lines.append("")  # blank line between customers
 
     return "\n".join(lines).rstrip()
 
 
-def summarize_developer_passwords(dev_passwords: Dict[str, Any]) -> str:
+def summarize_developer_passwords(dev_passwords: dict[str, Any]) -> str:
     """Format the developer credential information."""
     lines: list[str] = []
     if not dev_passwords:
@@ -130,7 +137,9 @@ def main() -> None:
     # Fallback: try pulling credentials directly from the module if not exposed at root.
     if developer_passwords is None and args.module_dir.exists():
         module_output = run_terraform_output(args.module_dir)
-        developer_passwords = (module_output.get("developer_passwords") or {}).get("value") or {}
+        developer_passwords = (module_output.get("developer_passwords") or {}).get(
+            "value",
+        ) or {}
     else:
         developer_passwords = developer_passwords or {}
 

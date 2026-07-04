@@ -2,9 +2,9 @@
 
 import argparse
 import plistlib
-import uuid
-import sys
 import random
+import sys
+import uuid
 
 
 # closure which generates a function that returns a simple command dictionary
@@ -79,7 +79,7 @@ def settings(args):
                 "MDMOptions": {
                     "BootstrapTokenAllowed": True,
                 },
-            }
+            },
         ]
     return c
 
@@ -94,7 +94,8 @@ def make_device_lock_command(args):
 
 def sched_update_subparser(parser):
     sched_update_parser = parser.add_parser(
-        "ScheduleOSUpdate", help="ScheduleOSUpdate MDM command"
+        "ScheduleOSUpdate",
+        help="ScheduleOSUpdate MDM command",
     )
     sched_update_parser.add_argument(
         "action",
@@ -143,7 +144,8 @@ def dev_info_subparser(parser):
 
 def inst_prof_subparser(parser):
     inst_prof_parser = parser.add_parser(
-        "InstallProfile", help="InstallProfile MDM command"
+        "InstallProfile",
+        help="InstallProfile MDM command",
     )
     inst_prof_parser.add_argument(
         "mobileconfig",
@@ -156,7 +158,8 @@ def inst_prof_subparser(parser):
 
 def rem_prof_subparser(parser):
     rem_prof_parser = parser.add_parser(
-        "RemoveProfile", help="RemoveProfile MDM command"
+        "RemoveProfile",
+        help="RemoveProfile MDM command",
     )
     rem_prof_parser.add_argument(
         "identifier",
@@ -168,9 +171,7 @@ def rem_prof_subparser(parser):
 
 
 def account_config_subparser(parser):
-    p = parser.add_parser(
-        "AccountConfig", help="AccountConfiguration MDM command"
-    )
+    p = parser.add_parser("AccountConfig", help="AccountConfiguration MDM command")
     p.add_argument(
         "-f",
         "--fullname",
@@ -194,9 +195,7 @@ def account_config_subparser(parser):
 
 
 def settings_subparser(parser):
-    settings_parser = parser.add_parser(
-        "Settings", help="Settings MDM command"
-    )
+    settings_parser = parser.add_parser("Settings", help="Settings MDM command")
     settings_parser.add_argument(
         "--allowbst",
         action="store_true",
@@ -206,7 +205,7 @@ def settings_subparser(parser):
     return settings_parser
 
 
-def make_erase_device_subparser(parser):
+def make_erase_device_subparser(parser) -> None:
     p = parser.add_parser("EraseDevice", help="EraseDevice MDM command")
     p.add_argument(
         "pin",
@@ -216,7 +215,7 @@ def make_erase_device_subparser(parser):
     p.set_defaults(func=make_erase_device_command)
 
 
-def make_device_lock_subparser(parser):
+def make_device_lock_subparser(parser) -> None:
     p = parser.add_parser("DeviceLock", help="DeviceLock MDM command")
     p.add_argument(
         "pin",
@@ -237,7 +236,8 @@ def simple_command_subparser(request_type, parser):
 
 def command_subparser(parser):
     command_parser = parser.add_parser(
-        "command", help="arbitrary MDM command (simple non-argument command)"
+        "command",
+        help="arbitrary MDM command (simple non-argument command)",
     )
     command_parser.add_argument(
         "request_type",
@@ -248,7 +248,7 @@ def command_subparser(parser):
     return command_parser
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="MDM command generator")
     parser.add_argument(
         "-u",

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import pathlib
+
 import requests
 
 # First make sure the environment variable exists
@@ -21,7 +23,7 @@ script_path = "script.sh"  # relative path to this file (example is a script in 
 
 
 def get_all_results(endpoint, key, headers=None, params=None, per_page=10):
-    """generic GET request that handles pagination"""
+    """Generic GET request that handles pagination."""
     all_results = []
     page = 0
 
@@ -58,16 +60,17 @@ def get_all_results(endpoint, key, headers=None, params=None, per_page=10):
 
 
 def upload_script(script_path, team_id):
-    """
-    Upload a script to team if not already present.
-    Patch it if present
+    """Upload a script to team if not already present.
+    Patch it if present.
     """
     headers = {"Authorization": f"Bearer {api_token}"}
-    script_name = os.path.basename(script_path)
+    script_name = pathlib.Path(script_path).name
 
     # Check if script already exists in this team
     existing_scripts = get_all_results(
-        "scripts", "scripts", params={"team_id": team_id}
+        "scripts",
+        "scripts",
+        params={"team_id": team_id},
     )
 
     existing_script_id = None
@@ -76,13 +79,13 @@ def upload_script(script_path, team_id):
             existing_script_id = script.get("id")
             break
 
-    with open(script_path, "rb") as script_file:
+    with pathlib.Path(script_path).open("rb") as script_file:
         files = {
             "script": (
                 script_name,
                 script_file,
                 "application/octet-stream",
-            )
+            ),
         }
 
         if existing_script_id:

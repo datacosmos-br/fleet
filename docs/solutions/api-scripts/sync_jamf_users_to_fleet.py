@@ -59,7 +59,6 @@ import time
 
 import requests
 
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -81,7 +80,8 @@ FLEET_REQUEST_DELAY = 0.05  # seconds
 # Startup validation
 # ---------------------------------------------------------------------------
 
-def _die(msg):
+
+def _die(msg) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -102,7 +102,7 @@ if not _have_oauth and not _have_basic:
     _die(
         "Jamf credentials are not set. "
         "Provide JAMF_CLIENT_ID + JAMF_CLIENT_SECRET (preferred) "
-        "or JAMF_USERNAME + JAMF_PASSWORD."
+        "or JAMF_USERNAME + JAMF_PASSWORD.",
     )
 
 
@@ -165,6 +165,7 @@ def _jamf_headers() -> dict:
 # ---------------------------------------------------------------------------
 # Jamf helpers
 # ---------------------------------------------------------------------------
+
 
 def get_all_jamf_computers():
     """Yield computer records from Jamf (id + serial_number + user).
@@ -229,8 +230,12 @@ def assign_fleet_device_mapping(host_id: int, email: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -253,7 +258,7 @@ def main():
 
     for computer in get_all_jamf_computers():
         serial = computer["serial_number"]
-        jamf_id = computer["jamf_id"]
+        computer["jamf_id"]
 
         if not serial:
             skipped_no_serial += 1
@@ -289,14 +294,18 @@ def main():
                 print(f"  [OK]   {serial} → {user} (Fleet host ID {host['id']})")
                 assigned += 1
             except requests.HTTPError as exc:
-                print(f"  [WARN] Fleet error assigning {user} to host {host['id']}: {exc}")
+                print(
+                    f"  [WARN] Fleet error assigning {user} to host {host['id']}: {exc}",
+                )
                 errors += 1
 
             time.sleep(FLEET_REQUEST_DELAY)
 
     print()
     print("Done (dry run — no changes were made)." if dry_run else "Done.")
-    print(f"  {'Would assign' if dry_run else 'Assigned'}                   : {assigned}")
+    print(
+        f"  {'Would assign' if dry_run else 'Assigned'}                   : {assigned}",
+    )
     print(f"  Skipped (no serial in Jamf): {skipped_no_serial}")
     print(f"  Skipped (no user in Jamf)  : {skipped_no_user}")
     print(f"  Skipped (not in Fleet)     : {skipped_not_in_fleet}")
