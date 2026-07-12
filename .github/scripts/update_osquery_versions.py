@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""Update the minimum osquery version options in the Fleet frontend constants.
+
+Fetches the osquery release tags from the GitHub API and inserts any new
+versions into MIN_OSQUERY_VERSION_OPTIONS in frontend/utilities/constants.tsx.
+"""
+
 import http.client
 import json
 import os
@@ -6,10 +13,11 @@ import re
 
 # Use GITHUB_WORKSPACE to get the root of your repository
 repo_root = os.environ.get("GITHUB_WORKSPACE", "")
-FILE_PATH = os.path.join(repo_root, "frontend", "utilities", "constants.tsx")
+FILE_PATH = pathlib.Path(repo_root) / "frontend" / "utilities" / "constants.tsx"
 
 
-def fetch_osquery_versions():
+def fetch_osquery_versions() -> list[str]:
+    """Return the tag names of all osquery releases from the GitHub API."""
     conn = http.client.HTTPSConnection("api.github.com")
     conn.request(
         "GET",
@@ -23,8 +31,9 @@ def fetch_osquery_versions():
     return [release["tag_name"] for release in json.loads(content.decode("utf-8"))]
 
 
-def update_min_osquery_version_options(new_versions) -> None:
-    content = pathlib.Path(FILE_PATH).read_text(encoding="utf-8")
+def update_min_osquery_version_options(new_versions: list[str]) -> None:
+    """Insert any new osquery versions into the frontend constants file."""
+    content = FILE_PATH.read_text(encoding="utf-8")
 
     # Extract current versions
     current_versions = re.findall(
@@ -50,7 +59,7 @@ def update_min_osquery_version_options(new_versions) -> None:
         )
 
         # Write updated content back to file
-        pathlib.Path(FILE_PATH).write_text(updated_content, encoding="utf-8")
+        FILE_PATH.write_text(updated_content, encoding="utf-8")
 
         print(f"Added new versions: {versions_to_add}")
     else:

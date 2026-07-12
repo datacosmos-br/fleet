@@ -1,29 +1,36 @@
-# This script takes two CIS Benchmark PDFs as input and diffs them
-# For example: It will generate a diff of the Win10 & W11 benchmarks
-# Requires installation of the PyMuPDF dep (pip3 install PyMuPDF).
-# cmd line example: Python3 ./CIS-Benchmark-diff.py File1.pdf File2.pdf
+#!/usr/bin/env python3
+"""Diff the recommendation sections of two CIS Benchmark PDFs.
+
+For example: generate a diff of the Win10 & W11 benchmarks.
+Requires installation of the PyMuPDF dep (pip3 install PyMuPDF).
+cmd line example: python3 ./CIS-Benchmark-diff.py File1.pdf File2.pdf
+"""
 
 import difflib
 import pathlib
 import re
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 
 import fitz  # PyMuPDF
 
+# Script name plus the two PDF paths.
+REQUIRED_ARGC = 3
 
-def is_start_of_new_item(line):
+
+def is_start_of_new_item(line: str) -> bool:
     """Check if a line starts with a number pattern like '1', '1.1', up to '100.7.32'."""
     return bool(re.match(r"\d{1,3}(?:\.\d{1,2}){0,2}", line.strip()))
 
 
-def remove_trailing_whitespace(text):
+def remove_trailing_whitespace(text: str) -> str:
     """Remove trailing whitespace from each line in the text."""
     return "\n".join(line.rstrip() for line in text.split("\n"))
 
 
-def correct_word_wrapping(text):
+def correct_word_wrapping(text: str) -> str:
     """Correct word wrapping issues in the extracted text.
+
     Each line should start with a number pattern from '1' to '100.7.32'.
     """
     lines = text.split("\n")
@@ -37,7 +44,11 @@ def correct_word_wrapping(text):
     return "\n".join(corrected_lines)
 
 
-def extract_recommendations_fitz(pdf_path, start_phrase, end_phrase):
+def extract_recommendations_fitz(
+    pdf_path: str,
+    start_phrase: str,
+    end_phrase: str,
+) -> str:
     """Extract a specific section from a PDF file."""
     doc = fitz.open(pdf_path)
     recommendations = ""
@@ -83,7 +94,7 @@ def extract_recommendations_fitz(pdf_path, start_phrase, end_phrase):
     )  # Remove trailing whitespace
 
 
-def create_custom_diff(text1, text2):
+def create_custom_diff(text1: str, text2: str) -> str:
     """Create a custom diff of two texts with custom labels."""
     text1_lines = text1.splitlines()
     text2_lines = text2.splitlines()
@@ -111,7 +122,8 @@ def create_custom_diff(text1, text2):
     return "\n".join(custom_diff)
 
 
-def main(file1, file2) -> None:
+def main(file1: str, file2: str) -> None:
+    """Extract recommendations from both PDFs and write the diff outputs."""
     # Start and end phrases for the extraction
     start_phrase = "Recommendations ..."
     end_phrase = "Appendix: Summary Table ..."
@@ -140,7 +152,7 @@ def main(file1, file2) -> None:
     diff_result = create_custom_diff(recommendations_file1, recommendations_file2)
 
     # Write the diff result to a file with a timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     with pathlib.Path("cis_benchmarks_diff.txt").open("w", encoding="utf-8") as file:
         file.write(f"Diff generated on: {timestamp}\n\n")
         file.write(diff_result)
@@ -148,7 +160,7 @@ def main(file1, file2) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) != REQUIRED_ARGC:
         print(
             "Usage: python script.py <path_to_cis_benchmark_1_pdf> <path_to_cis_benchmark_2_pdf>",
         )

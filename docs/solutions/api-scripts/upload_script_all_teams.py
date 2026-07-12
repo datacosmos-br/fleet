@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
+"""Upload a shell script to every team on a Fleet server via the API.
+
+First make sure the environment variable exists:
+> export FLEET_API_TOKEN="your_token"
+"""
 
 import os
 import pathlib
+import sys
 
 import requests
 
-# First make sure the environment variable exists
-# > export FLEET_API_TOKEN="your_token"
+type JsonValue = (
+    bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
+)
+
 api_token = os.getenv("FLEET_API_TOKEN")
 if not api_token:
-    print("No token found in the environment")
-    raise
+    sys.exit("No token found in the environment")
 
 #############################
 # ENTER YOUR INFORMATION HERE
@@ -21,8 +28,16 @@ script_path = "script.sh"  # relative path to this file (example is a script in 
 #
 # END
 
+REQUEST_TIMEOUT = 30
 
-def get_all_results(endpoint, key, headers=None, params=None, per_page=10):
+
+def get_all_results(
+    endpoint: str,
+    key: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, str | int] | None = None,
+    per_page: int = 10,
+) -> list[dict[str, JsonValue]]:
     """Generic GET request that handles pagination."""
     all_results = []
     page = 0
@@ -41,6 +56,7 @@ def get_all_results(endpoint, key, headers=None, params=None, per_page=10):
             endpoint,
             headers=headers,
             params=params,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
 
@@ -59,8 +75,9 @@ def get_all_results(endpoint, key, headers=None, params=None, per_page=10):
     return all_results
 
 
-def upload_script(script_path, team_id):
+def upload_script(script_path: str, team_id: int) -> requests.Response:
     """Upload a script to team if not already present.
+
     Patch it if present.
     """
     headers = {"Authorization": f"Bearer {api_token}"}
@@ -91,13 +108,23 @@ def upload_script(script_path, team_id):
         if existing_script_id:
             # Script exists - PATCH to update
             endpoint = f"{base_url}/{api_path}/scripts/{existing_script_id}"
-            response = requests.patch(endpoint, headers=headers, files=files)
+            response = requests.patch(
+                endpoint,
+                headers=headers,
+                files=files,
+                timeout=REQUEST_TIMEOUT,
+            )
             action = "updated"
         else:
             # Script doesn't exist - POST to create
             endpoint = f"{base_url}/{api_path}/scripts"
             files["team_id"] = (None, str(team_id))  # Add team_id to form data
-            response = requests.post(endpoint, headers=headers, files=files)
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                files=files,
+                timeout=REQUEST_TIMEOUT,
+            )
             action = "created"
 
     response.raise_for_status()

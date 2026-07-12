@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -13,17 +13,20 @@ from typing import Any
 
 def run_terraform_output(directory: Path) -> dict[str, Any]:
     """Return the parsed JSON from `terraform output -json` in `directory`."""
+    # Resolve the absolute binary path: S607 (partial executable path) and it
+    # also makes the "terraform not installed" failure explicit up front.
+    terraform = shutil.which("terraform")
+    if terraform is None:
+        print("terraform executable not found in PATH", file=sys.stderr)
+        sys.exit(1)
     try:
         proc = subprocess.run(
-            ["terraform", "output", "-json"],
+            [terraform, "output", "-json"],
             cwd=directory,
             check=True,
             capture_output=True,
             text=True,
         )
-    except FileNotFoundError:
-        print("terraform executable not found in PATH", file=sys.stderr)
-        sys.exit(1)
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         stdout = (exc.stdout or "").strip()
@@ -108,35 +111,53 @@ def summarize_developer_passwords(dev_passwords: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def main() -> None:
+def _parse_cli(argv: list[str]) -> tuple[Path, Path]:
+    """Parse the ``--tf-dir``/``--module-dir`` flags with dynamic defaults.
+
+    NOTE (multi-agent, bead cosmos-main-jmg3): argparse e banned-api (TID251)
+    no workspace; o parse manual zero-dependencia preserva o contrato da CLI.
+
+    Returns:
+        Tuple of ``(tf_dir, module_dir)``.
+    """
     script_path = Path(__file__).resolve()
     default_root = script_path.parent.parent
+    tf_dir = default_root
+    module_dir = default_root / "mysql_dev_access"
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--tf-dir" and index + 1 < len(argv):
+            tf_dir = Path(argv[index + 1])
+            index += 2
+        elif token == "--module-dir" and index + 1 < len(argv):
+            module_dir = Path(argv[index + 1])
+            index += 2
+        elif token in {"-h", "--help"}:
+            print(
+                "Display db-temp database details and developer credentials "
+                "using terraform output -json.\n"
+                "Usage: show_db_temp_info.py [--tf-dir PATH] [--module-dir PATH]",
+            )
+            sys.exit(0)
+        else:
+            print(f"invalid argument: {token}", file=sys.stderr)
+            sys.exit(2)
+    return tf_dir, module_dir
 
-    parser = argparse.ArgumentParser(
-        description="Display db-temp database details and developer credentials using terraform output -json.",
-    )
-    parser.add_argument(
-        "--tf-dir",
-        type=Path,
-        default=default_root,
-        help="Path to the db-temp Terraform root (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--module-dir",
-        type=Path,
-        default=default_root / "mysql_dev_access",
-        help="Path to the mysql_dev_access module (used as a fallback for credentials).",
-    )
-    args = parser.parse_args()
 
-    tf_output = run_terraform_output(args.tf_dir)
+def main() -> None:
+    """Parse options and print the db-temp Terraform output summary."""
+    tf_dir, module_dir = _parse_cli(sys.argv[1:])
+
+    tf_output = run_terraform_output(tf_dir)
 
     databases = (tf_output.get("databases") or {}).get("value") or {}
     developer_passwords = (tf_output.get("developer_passwords") or {}).get("value")
 
     # Fallback: try pulling credentials directly from the module if not exposed at root.
-    if developer_passwords is None and args.module_dir.exists():
-        module_output = run_terraform_output(args.module_dir)
+    if developer_passwords is None and module_dir.exists():
+        module_output = run_terraform_output(module_dir)
         developer_passwords = (module_output.get("developer_passwords") or {}).get(
             "value",
         ) or {}

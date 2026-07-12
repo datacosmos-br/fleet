@@ -52,10 +52,11 @@ Usage
   python3 sync_jamf_users_to_fleet.py
 """
 
-import argparse
 import os
 import sys
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 import requests
 
@@ -81,7 +82,7 @@ FLEET_REQUEST_DELAY = 0.05  # seconds
 # ---------------------------------------------------------------------------
 
 
-def _die(msg) -> None:
+def _die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -110,14 +111,20 @@ if not _have_oauth and not _have_basic:
 # Jamf authentication
 # ---------------------------------------------------------------------------
 
-_jamf_token: str = ""
-_jamf_token_expires_at: float = 0.0
+
+@dataclass
+class _TokenCache:
+    """Mutable holder for the Jamf bearer token (avoids `global` rebinding)."""
+
+    token: str = ""
+    expires_at: float = 0.0
+
+
+_token_cache = _TokenCache()
 
 
 def _refresh_jamf_token() -> str:
     """Obtain or renew a Jamf Pro bearer token and return it."""
-    global _jamf_token, _jamf_token_expires_at
-
     if _have_oauth:
         # OAuth 2.0 client credentials (Jamf Pro 10.49+)
         resp = requests.post(
@@ -132,8 +139,8 @@ def _refresh_jamf_token() -> str:
         )
         resp.raise_for_status()
         body = resp.json()
-        _jamf_token = body["access_token"]
-        _jamf_token_expires_at = time.time() + body.get("expires_in", 1800)
+        _token_cache.token = body["access_token"]
+        _token_cache.expires_at = time.time() + body.get("expires_in", 1800)
     else:
         # Basic-auth token exchange (Jamf Pro 10.35+)
         resp = requests.post(
@@ -144,20 +151,19 @@ def _refresh_jamf_token() -> str:
         )
         resp.raise_for_status()
         body = resp.json()
-        _jamf_token = body["token"]
-        _jamf_token_expires_at = time.time() + 1800  # default 30-min lifetime
+        _token_cache.token = body["token"]
+        _token_cache.expires_at = time.time() + 1800  # default 30-min lifetime
 
-    return _jamf_token
+    return _token_cache.token
 
 
 def _jamf_headers() -> dict:
     """Return request headers with a valid Jamf bearer token."""
-    global _jamf_token, _jamf_token_expires_at
     # Refresh 60 s before expiry to avoid mid-run failures
-    if not _jamf_token or time.time() >= _jamf_token_expires_at - 60:
+    if not _token_cache.token or time.time() >= _token_cache.expires_at - 60:
         _refresh_jamf_token()
     return {
-        "Authorization": f"Bearer {_jamf_token}",
+        "Authorization": f"Bearer {_token_cache.token}",
         "Accept": "application/json",
     }
 
@@ -167,7 +173,7 @@ def _jamf_headers() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def get_all_jamf_computers():
+def get_all_jamf_computers() -> Iterator[dict[str, int | str | None]]:
     """Yield computer records from Jamf (id + serial_number + user).
 
     Uses the Classic API /subset/basic endpoint, which returns serial_number,
@@ -231,18 +237,31 @@ def assign_fleet_device_mapping(host_id: int, email: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _parse_cli(argv: list[str]) -> bool:
+    """Parse the ``--dry-run`` flag.
+
+    NOTE (multi-agent, bead cosmos-main-jmg3): argparse e banned-api (TID251)
+    no workspace; o parse manual zero-dependencia preserva o contrato da CLI.
+
+    Returns:
+        True when ``--dry-run`` was passed.
+    """
+    dry_run = False
+    for token in argv:
+        if token == "--dry-run":
+            dry_run = True
+        elif token in {"-h", "--help"}:
+            print(__doc__)
+            sys.exit(0)
+        else:
+            print(f"invalid argument: {token}", file=sys.stderr)
+            sys.exit(2)
+    return dry_run
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Log what would be assigned without making any changes in Fleet.",
-    )
-    args = parser.parse_args()
-    dry_run = args.dry_run
+    """Sync Jamf device-to-user assignments into Fleet (see module docstring)."""
+    dry_run = _parse_cli(sys.argv[1:])
 
     if dry_run:
         print("DRY RUN — no changes will be made in Fleet.")
@@ -258,7 +277,6 @@ def main() -> None:
 
     for computer in get_all_jamf_computers():
         serial = computer["serial_number"]
-        computer["jamf_id"]
 
         if not serial:
             skipped_no_serial += 1

@@ -11,19 +11,22 @@ Usage:
 Dependencies: pyyaml (pip3 install pyyaml)
 """
 
-import argparse
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import NoReturn
+from urllib.parse import parse_qs, quote, urlparse
 
+import requests
 import yaml
 
 # Absolute temp directory, resolved relative to this file so the tool
@@ -58,7 +61,14 @@ SSH_OPTS = (
     "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 )
 VM_USER = "admin"
-VM_PASS = "admin"
+# Default password of the cirruslabs macOS base images; override for custom ones.
+VM_PASS = os.environ.get("CIS_VM_PASSWORD", "admin")
+
+# Two policies sharing a CIS ID are needed to form an org-decision pair.
+MIN_POLICIES_FOR_ORG_PAIR = 2
+
+# MDM enrollment-status checks before giving up and prompting the user.
+MDM_STATUS_CHECK_ATTEMPTS = 6
 
 # CIS IDs whose test scripts disable SSH, breaking our connection to
 # the VM. These are tested as MANUAL (prompting the user) rather than
@@ -185,6 +195,8 @@ def read_fleetctl_config(context: str = "default") -> dict:
 
 @dataclass
 class Policy:
+    """CIS policy parsed from the policy YAML file."""
+
     cis_id: str
     name: str
     query: str
@@ -195,6 +207,8 @@ class Policy:
 
 @dataclass
 class TestPlan:
+    """A policy mapped to its test artifacts and test type."""
+
     policy: Policy
     test_type: str  # PASS_FAIL, PASS_ONLY, PROFILE, ORG_DECISION, MANUAL
     pass_script: Path | None = None
@@ -209,6 +223,8 @@ class TestPlan:
 
 @dataclass
 class TestResult:
+    """Outcome of a single executed test plan."""
+
     cis_id: str
     name: str
     status: str  # PASS, FAIL, SKIP, ERROR
@@ -217,6 +233,8 @@ class TestResult:
 
 @dataclass
 class FleetTeam:
+    """Temporary Fleet team created for the test run."""
+
     name: str
     team_id: int = 0
     enroll_secret: str = ""
@@ -228,19 +246,30 @@ class FleetTeam:
 # Logging helpers
 # ---------------------------------------------------------------------------
 
-VERBOSE = False
+
+@dataclass
+class _RunnerFlags:
+    """Run-wide mutable flags (avoids rebinding module globals)."""
+
+    verbose: bool = False
+
+
+_FLAGS = _RunnerFlags()
 
 
 def log(msg: str) -> None:
+    """Print an informational progress line."""
     print(f"[*] {msg}", flush=True)
 
 
 def log_verbose(msg: str) -> None:
-    if VERBOSE:
+    """Print a detail line when verbose mode is enabled."""
+    if _FLAGS.verbose:
         print(f"    {msg}", flush=True)
 
 
 def log_error(msg: str) -> None:
+    """Print an error line to stderr."""
     print(f"[!] {msg}", file=sys.stderr, flush=True)
 
 
@@ -435,8 +464,6 @@ def build_test_plans(
         non_automatable_ids = {}
 
     # First pass: group policies by CIS ID to detect org-decision pairs
-    from collections import defaultdict
-
     by_cis_id: dict[str, list[Policy]] = defaultdict(list)
     for p in policies:
         by_cis_id[p.cis_id].append(p)
@@ -448,8 +475,8 @@ def build_test_plans(
     org_decision_pairs: dict[str, tuple[Policy, Policy]] = {}
     org_decision_policies: set[str] = set()  # names of policies in a pair
 
-    for cis_id, pols in by_cis_id.items():
-        if len(pols) < 2:
+    for pols in by_cis_id.values():
+        if len(pols) < MIN_POLICIES_FOR_ORG_PAIR:
             continue
         enables = [p for p in pols if _is_enable_variant(p)]
         disables = [p for p in pols if not _is_enable_variant(p)]
@@ -584,6 +611,7 @@ def run_cmd(
         capture_output=capture,
         text=True,
         timeout=timeout,
+        check=False,  # the wrapper raises CalledProcessError itself when asked
     )
     if capture and result.stdout:
         log_verbose(result.stdout.rstrip())
@@ -657,24 +685,28 @@ def fleet_api(
 ) -> dict | None:
     """Make a Fleet API request. Returns parsed JSON or None."""
     url = f"{fleet_url}{path}"
-    data = json.dumps(body).encode() if body else None
-    req = Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
-    if data:
-        req.add_header("Content-Type", "application/json")
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        with urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            if raw:
-                return json.loads(raw)
-            return None
-    except HTTPError as e:
-        body_text = e.read().decode() if e.fp else ""
-        log_error(f"Fleet API {method} {path} returned {e.code}: {body_text}")
+        resp = requests.request(
+            method,
+            url,
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        response = e.response
+        status = response.status_code if response is not None else "?"
+        body_text = response.text if response is not None else ""
+        log_error(f"Fleet API {method} {path} returned {status}: {body_text}")
         raise
-    except URLError as e:
-        log_error(f"Fleet API {method} {path} failed: {e.reason}")
+    except requests.RequestException as e:
+        log_error(f"Fleet API {method} {path} failed: {e}")
         raise
+    if resp.content:
+        return resp.json()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +715,6 @@ def fleet_api(
 
 
 def create_fleet_team(
-    fleet_url: str,
-    token: str,
     fleetctl: str,
     team_name: str,
     enroll_secret: str,
@@ -754,8 +784,6 @@ def create_fleet_team(
 
 
 def push_profiles_to_team(
-    fleet_url: str,
-    token: str,
     fleetctl: str,
     team_name: str,
     profiles: list[Path],
@@ -775,11 +803,8 @@ def push_profiles_to_team(
             continue
         seen.add(key)
         unique.append(p)
-    if not unique:
-        # Push an empty list to clear the team's profiles
-        custom_settings = []
-    else:
-        custom_settings = [{"path": str(p)} for p in unique]
+    # Push an empty list to clear the team's profiles when nothing is left
+    custom_settings = [] if not unique else [{"path": str(p)} for p in unique]
 
     team_yaml = {
         "apiVersion": "v1",
@@ -819,7 +844,7 @@ def delete_fleet_team(fleet_url: str, token: str, team_id: int) -> None:
     log(f"Deleting Fleet team ID {team_id}")
     try:
         fleet_api(fleet_url, token, "DELETE", f"/api/v1/fleet/teams/{team_id}")
-    except HTTPError:
+    except requests.HTTPError:
         log_error(f"Failed to delete team {team_id}")
 
 
@@ -828,7 +853,7 @@ def delete_fleet_host(fleet_url: str, token: str, host_id: int) -> None:
     log(f"Deleting Fleet host ID {host_id}")
     try:
         fleet_api(fleet_url, token, "DELETE", f"/api/v1/fleet/hosts/{host_id}")
-    except HTTPError:
+    except requests.HTTPError:
         log_error(f"Failed to delete host {host_id}")
 
 
@@ -848,15 +873,13 @@ def transfer_host_to_team(
             "/api/v1/fleet/hosts/transfer",
             body={"team_id": team_id, "hosts": [host_id]},
         )
-    except HTTPError as e:
+    except requests.HTTPError as e:
         log_error(f"Failed to transfer host {host_id} to team {team_id}: {e}")
         raise
 
 
 def get_host_by_hostname(fleet_url: str, token: str, hostname: str) -> dict | None:
     """Look up a host by hostname in Fleet (case-insensitive)."""
-    from urllib.parse import quote
-
     target = hostname.lower()
     data = fleet_api(
         fleet_url,
@@ -911,7 +934,9 @@ def build_fleet_pkg(fleet_url: str, enroll_secret: str, fleetctl: str) -> Path:
 
 
 def vm_exists(name: str) -> bool:
+    """Check whether a tart VM with this name exists."""
     result = run_cmd(["tart", "list"], check=False)
+    return name in (result.stdout or "")
     return name in (result.stdout or "")
 
 
@@ -924,6 +949,7 @@ def vm_is_running(name: str) -> bool:
 
 
 def create_vm(name: str, image: str) -> None:
+    """Clone a fresh tart VM from the base image, replacing any existing one."""
     if vm_exists(name):
         log(f"VM {name} already exists, deleting...")
         run_cmd(["tart", "stop", name], check=False)
@@ -935,6 +961,7 @@ def create_vm(name: str, image: str) -> None:
 
 
 def start_vm(name: str) -> subprocess.Popen:
+    """Start the tart VM in the background and return its process."""
     log(f"Starting VM {name}...")
     return subprocess.Popen(
         ["tart", "run", name],
@@ -971,10 +998,12 @@ def wait_for_ssh(ip: str, timeout: int = 120) -> None:
 
 
 def stop_vm(name: str) -> None:
+    """Stop the tart VM if it is running."""
     run_cmd(["tart", "stop", name], check=False)
 
 
 def delete_vm(name: str) -> None:
+    """Stop and delete the tart VM."""
     run_cmd(["tart", "stop", name], check=False)
     time.sleep(2)
     run_cmd(["tart", "delete", name], check=False)
@@ -1027,13 +1056,13 @@ def wait_for_fleet_registration(
     url = f"{fleet_url}/device/{identifier}"
     while time.time() < deadline:
         try:
-            req = Request(url)
-            with urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    log("Host registered in Fleet")
-                    return
-        except (HTTPError, URLError):
+            resp = requests.get(url, timeout=10)
+        except requests.RequestException:
             pass
+        else:
+            if resp.status_code == HTTPStatus.OK:
+                log("Host registered in Fleet")
+                return
         time.sleep(5)
     msg = "Host did not register in Fleet"
     raise TimeoutError(msg)
@@ -1064,12 +1093,12 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
 
     # Download on the host side first to check what we got
     try:
-        req = Request(mdm_api_url)
-        with urlopen(req, timeout=30) as resp:
-            content = resp.read()
-    except (HTTPError, URLError) as e:
+        resp = requests.get(mdm_api_url, timeout=30)
+        resp.raise_for_status()
+        content = resp.content
+    except requests.RequestException as e:
         msg = f"Failed to fetch MDM enrollment profile: {e}"
-        raise RuntimeError(msg)
+        raise RuntimeError(msg) from e
 
     # The device API may return:
     # a) An actual mobileconfig (legacy)
@@ -1085,8 +1114,6 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
 
         if enroll_url:
             # Extract enroll_secret from the URL and build OTA URL
-            from urllib.parse import parse_qs, urlparse
-
             parsed = urlparse(enroll_url)
             qs = parse_qs(parsed.query)
             enroll_secret = qs.get("enroll_secret", [""])[0]
@@ -1102,17 +1129,17 @@ def enroll_mdm(ip: str, fleet_url: str, identifier: str) -> None:
             )
             log_verbose(f"Fetching OTA enrollment profile from {ota_url}")
             try:
-                req = Request(ota_url)
-                with urlopen(req, timeout=30) as resp:
-                    content = resp.read()
-            except (HTTPError, URLError) as e:
+                resp = requests.get(ota_url, timeout=30)
+                resp.raise_for_status()
+                content = resp.content
+            except requests.RequestException as e:
                 msg = (
                     f"Failed to fetch OTA enrollment profile: {e}. "
                     "Ensure Apple MDM is configured on the Fleet server."
                 )
                 raise RuntimeError(
                     msg,
-                )
+                ) from e
 
     if b"<?xml" not in content and b"plist" not in content:
         msg = (
@@ -1243,7 +1270,13 @@ def run_script_on_vm(ip: str, script_path: Path) -> subprocess.CompletedProcess:
     failure as ERROR (with the script's stderr) rather than masking it
     as a spurious PASS/FAIL on the follow-up query.
     """
-    remote_name = f"/tmp/{script_path.name}"
+    # Create the remote copy via mktemp: no hardcoded temp path (S108) and
+    # no predictable-name collisions on shared VMs.
+    mktemp_result = ssh(ip, "mktemp -t cis-runner", timeout=10)
+    remote_name = mktemp_result.stdout.strip()
+    if mktemp_result.returncode != 0 or not remote_name:
+        msg = f"Could not create a remote temp file for {script_path.name}"
+        raise RuntimeError(msg)
     scp_to_vm(ip, script_path, remote_name)
     ssh(ip, f"chmod +x {remote_name}", timeout=10)
     result = ssh(
@@ -1283,6 +1316,274 @@ def prompt_manual(policy: Policy) -> bool:
     return response.strip().lower() != "skip"
 
 
+def _execute_test_plan(
+    plan: TestPlan,
+    ip: str,
+    hostname: str,
+    fleetctl: str,
+    query_timeout: int,
+    pre_profile_passed: set[str] | None = None,
+    team_name: str = "",
+    base_profiles: list[Path] | None = None,
+) -> TestResult:
+    """Dispatch body of run_test, split out to keep its try clause small.
+
+    Holds the per-test-type logic; run_test only wraps this in the
+    error-to-TestResult translation (PLW0717).
+    """
+    policy = plan.policy
+    cis_id = policy.cis_id
+    name = policy.name
+
+    if plan.test_type == "PASS_FAIL":
+        # For MDM-backed policies, the local fail/pass scripts
+        # can't remove MDM-delivered profiles. Instead, toggle
+        # the profile on/off via the team's MDM settings.
+        uses_mdm = policy.needs_mdm and plan.profiles
+        if uses_mdm:
+            other_profiles = list(base_profiles or [])
+            # Drop this policy's profiles from the base set
+            this_profile_paths = {str(p) for p in plan.profiles}
+            other_profiles = [
+                p for p in other_profiles if str(p) not in this_profile_paths
+            ]
+
+            mdm_deadline = 90
+
+            # Step 1: remove profile → query should poll to False
+            log_verbose("Removing profile via MDM...")
+            push_profiles_to_team(
+                fleetctl,
+                team_name,
+                other_profiles,
+            )
+            if not wait_for_query_pass(
+                policy.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=mdm_deadline,
+                expected=False,
+            ):
+                # Restore before returning
+                push_profiles_to_team(
+                    fleetctl,
+                    team_name,
+                    other_profiles + list(plan.profiles),
+                )
+                return TestResult(
+                    cis_id,
+                    name,
+                    "FAIL",
+                    "Query still passed after removing MDM profile "
+                    f"(waited {mdm_deadline}s)",
+                )
+
+            # Step 2: re-install profile → query should poll to True
+            log_verbose("Re-pushing profile via MDM...")
+            push_profiles_to_team(
+                fleetctl,
+                team_name,
+                other_profiles + list(plan.profiles),
+            )
+            if not wait_for_query_pass(
+                policy.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=mdm_deadline,
+                expected=True,
+            ):
+                return TestResult(
+                    cis_id,
+                    name,
+                    "FAIL",
+                    "Query did not pass after re-pushing MDM profile "
+                    f"(waited {mdm_deadline}s)",
+                )
+            return TestResult(cis_id, name, "PASS")
+
+        # Non-MDM PASS_FAIL: run the local scripts
+        log_verbose("Running fail script...")
+        run_script_on_vm(ip, plan.fail_script)
+        time.sleep(5)
+        if run_query(policy.query, hostname, fleetctl, query_timeout):
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "Expected query to fail after fail script, but it returned rows",
+            )
+
+        log_verbose("Running pass script...")
+        run_script_on_vm(ip, plan.pass_script)
+        time.sleep(5)
+        if not run_query(policy.query, hostname, fleetctl, query_timeout):
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "Expected query to pass after pass script, but it returned no rows",
+            )
+
+        return TestResult(cis_id, name, "PASS")
+
+    if plan.test_type == "PASS_ONLY":
+        log_verbose("Running pass-only script...")
+        run_script_on_vm(ip, plan.pass_only_script)
+        time.sleep(5)
+        if not run_query(policy.query, hostname, fleetctl, query_timeout):
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "Query returned no rows after running pass script",
+            )
+        return TestResult(cis_id, name, "PASS")
+
+    if plan.test_type == "PROFILE":
+        # Profile-only test. Profiles were pushed in Phase 5.
+        # The post-profile query must pass. A pre-profile "passed"
+        # state (captured in Phase 5 before profiles were pushed)
+        # is noted as a warning in the details but does not fail
+        # the test — some queries check OS state (firewall,
+        # gatekeeper) that may be compliant regardless of profile.
+        log_verbose(f"Profile(s) pushed: {[p.name for p in plan.profiles]}")
+
+        details = ""
+        if pre_profile_passed and cis_id in pre_profile_passed:
+            details = (
+                "note: query passed before profile delivery — "
+                "the OS state may satisfy this regardless of MDM"
+            )
+
+        # Poll instead of checking once — MDM delivery time varies
+        # and the fixed 30s wait in Phase 5 isn't always enough.
+        if not wait_for_query_pass(policy.query, hostname, fleetctl, query_timeout):
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "Query returned no rows after MDM profile delivery",
+            )
+        return TestResult(cis_id, name, "PASS", details)
+
+    if plan.test_type == "ORG_DECISION":
+        # Org-decision pair: two contradicting policies share the
+        # same CIS ID (e.g., iCloud Drive enabled vs disabled).
+        # Test both directions using enable/disable profiles.
+        enable_pol = policy
+        disable_pol = plan.counterpart
+        enable_prof = plan.enable_profile
+        disable_prof = plan.disable_profile
+        org_deadline = 90
+
+        log_verbose(
+            f"Org-decision pair: "
+            f"enable={enable_prof.name if enable_prof else 'none'}, "
+            f"disable={disable_prof.name if disable_prof else 'none'}",
+        )
+
+        failures = []
+
+        # Include all base profiles alongside the org-decision
+        # profile so we don't wipe them from the team.
+        other_profiles = list(base_profiles or [])
+
+        # Step 1: Push enable profile, poll: enable passes + disable fails
+        if enable_prof:
+            log_verbose("Pushing enable profile + base profiles...")
+            push_profiles_to_team(
+                fleetctl,
+                team_name,
+                [*other_profiles, enable_prof],
+            )
+
+            if not wait_for_query_pass(
+                enable_pol.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=org_deadline,
+                expected=True,
+            ):
+                failures.append("Enable policy did not pass after enable profile")
+            if disable_pol and not wait_for_query_pass(
+                disable_pol.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=org_deadline,
+                expected=False,
+            ):
+                failures.append("Disable policy still passes after enable profile")
+
+        # Step 2: Push disable profile, poll: disable passes + enable fails
+        if disable_prof:
+            log_verbose("Pushing disable profile + base profiles...")
+            push_profiles_to_team(
+                fleetctl,
+                team_name,
+                [*other_profiles, disable_prof],
+            )
+
+            if disable_pol and not wait_for_query_pass(
+                disable_pol.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=org_deadline,
+                expected=True,
+            ):
+                failures.append("Disable policy did not pass after disable profile")
+            if not wait_for_query_pass(
+                enable_pol.query,
+                hostname,
+                fleetctl,
+                query_timeout,
+                deadline_seconds=org_deadline,
+                expected=False,
+            ):
+                failures.append("Enable policy still passes after disable profile")
+
+        # Restore base profiles without any org-decision profile.
+        # No polling here — no assertion about the resulting state,
+        # just letting the team settle before the next test.
+        if other_profiles:
+            log_verbose("Restoring base profiles...")
+            push_profiles_to_team(
+                fleetctl,
+                team_name,
+                other_profiles,
+            )
+            time.sleep(15)
+
+        if failures:
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "; ".join(failures),
+            )
+        return TestResult(cis_id, name, "PASS")
+
+    if plan.test_type == "MANUAL":
+        applied = prompt_manual(policy)
+        if not applied:
+            return TestResult(cis_id, name, "SKIP", "User skipped")
+        time.sleep(5)
+        if not run_query(policy.query, hostname, fleetctl, query_timeout):
+            return TestResult(
+                cis_id,
+                name,
+                "FAIL",
+                "Query returned no rows after manual remediation",
+            )
+        return TestResult(cis_id, name, "PASS")
+
+    return TestResult(cis_id, name, "ERROR", "Unexpected test type")
+
+
 def run_test(
     plan: TestPlan,
     ip: str,
@@ -1290,8 +1591,6 @@ def run_test(
     fleetctl: str,
     query_timeout: int,
     pre_profile_passed: set[str] | None = None,
-    fleet_url: str = "",
-    fleet_token: str = "",
     team_name: str = "",
     base_profiles: list[Path] | None = None,
 ) -> TestResult:
@@ -1303,270 +1602,20 @@ def run_test(
     log(f"Testing CIS {cis_id}: {name} [{plan.test_type}]")
 
     try:
-        if plan.test_type == "PASS_FAIL":
-            # For MDM-backed policies, the local fail/pass scripts
-            # can't remove MDM-delivered profiles. Instead, toggle
-            # the profile on/off via the team's MDM settings.
-            uses_mdm = policy.needs_mdm and plan.profiles
-            if uses_mdm:
-                other_profiles = list(base_profiles or [])
-                # Drop this policy's profiles from the base set
-                this_profile_paths = {str(p) for p in plan.profiles}
-                other_profiles = [
-                    p for p in other_profiles if str(p) not in this_profile_paths
-                ]
-
-                mdm_deadline = 90
-
-                # Step 1: remove profile → query should poll to False
-                log_verbose("Removing profile via MDM...")
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    other_profiles,
-                )
-                if not wait_for_query_pass(
-                    policy.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=mdm_deadline,
-                    expected=False,
-                ):
-                    # Restore before returning
-                    push_profiles_to_team(
-                        fleet_url,
-                        fleet_token,
-                        fleetctl,
-                        team_name,
-                        other_profiles + list(plan.profiles),
-                    )
-                    return TestResult(
-                        cis_id,
-                        name,
-                        "FAIL",
-                        "Query still passed after removing MDM profile "
-                        f"(waited {mdm_deadline}s)",
-                    )
-
-                # Step 2: re-install profile → query should poll to True
-                log_verbose("Re-pushing profile via MDM...")
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    other_profiles + list(plan.profiles),
-                )
-                if not wait_for_query_pass(
-                    policy.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=mdm_deadline,
-                    expected=True,
-                ):
-                    return TestResult(
-                        cis_id,
-                        name,
-                        "FAIL",
-                        "Query did not pass after re-pushing MDM profile "
-                        f"(waited {mdm_deadline}s)",
-                    )
-                return TestResult(cis_id, name, "PASS")
-
-            # Non-MDM PASS_FAIL: run the local scripts
-            log_verbose("Running fail script...")
-            run_script_on_vm(ip, plan.fail_script)
-            time.sleep(5)
-            if run_query(policy.query, hostname, fleetctl, query_timeout):
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "Expected query to fail after fail script, but it returned rows",
-                )
-
-            log_verbose("Running pass script...")
-            run_script_on_vm(ip, plan.pass_script)
-            time.sleep(5)
-            if not run_query(policy.query, hostname, fleetctl, query_timeout):
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "Expected query to pass after pass script, but it returned no rows",
-                )
-
-            return TestResult(cis_id, name, "PASS")
-
-        if plan.test_type == "PASS_ONLY":
-            log_verbose("Running pass-only script...")
-            run_script_on_vm(ip, plan.pass_only_script)
-            time.sleep(5)
-            if not run_query(policy.query, hostname, fleetctl, query_timeout):
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "Query returned no rows after running pass script",
-                )
-            return TestResult(cis_id, name, "PASS")
-
-        if plan.test_type == "PROFILE":
-            # Profile-only test. Profiles were pushed in Phase 5.
-            # The post-profile query must pass. A pre-profile "passed"
-            # state (captured in Phase 5 before profiles were pushed)
-            # is noted as a warning in the details but does not fail
-            # the test — some queries check OS state (firewall,
-            # gatekeeper) that may be compliant regardless of profile.
-            log_verbose(f"Profile(s) pushed: {[p.name for p in plan.profiles]}")
-
-            details = ""
-            if pre_profile_passed and cis_id in pre_profile_passed:
-                details = (
-                    "note: query passed before profile delivery — "
-                    "the OS state may satisfy this regardless of MDM"
-                )
-
-            # Poll instead of checking once — MDM delivery time varies
-            # and the fixed 30s wait in Phase 5 isn't always enough.
-            if not wait_for_query_pass(policy.query, hostname, fleetctl, query_timeout):
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "Query returned no rows after MDM profile delivery",
-                )
-            return TestResult(cis_id, name, "PASS", details)
-
-        if plan.test_type == "ORG_DECISION":
-            # Org-decision pair: two contradicting policies share the
-            # same CIS ID (e.g., iCloud Drive enabled vs disabled).
-            # Test both directions using enable/disable profiles.
-            enable_pol = policy
-            disable_pol = plan.counterpart
-            enable_prof = plan.enable_profile
-            disable_prof = plan.disable_profile
-            org_deadline = 90
-
-            log_verbose(
-                f"Org-decision pair: "
-                f"enable={enable_prof.name if enable_prof else 'none'}, "
-                f"disable={disable_prof.name if disable_prof else 'none'}",
-            )
-
-            failures = []
-
-            # Include all base profiles alongside the org-decision
-            # profile so we don't wipe them from the team.
-            other_profiles = list(base_profiles or [])
-
-            # Step 1: Push enable profile, poll: enable passes + disable fails
-            if enable_prof:
-                log_verbose("Pushing enable profile + base profiles...")
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    [*other_profiles, enable_prof],
-                )
-
-                if not wait_for_query_pass(
-                    enable_pol.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=org_deadline,
-                    expected=True,
-                ):
-                    failures.append("Enable policy did not pass after enable profile")
-                if disable_pol and not wait_for_query_pass(
-                    disable_pol.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=org_deadline,
-                    expected=False,
-                ):
-                    failures.append("Disable policy still passes after enable profile")
-
-            # Step 2: Push disable profile, poll: disable passes + enable fails
-            if disable_prof:
-                log_verbose("Pushing disable profile + base profiles...")
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    [*other_profiles, disable_prof],
-                )
-
-                if disable_pol and not wait_for_query_pass(
-                    disable_pol.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=org_deadline,
-                    expected=True,
-                ):
-                    failures.append("Disable policy did not pass after disable profile")
-                if not wait_for_query_pass(
-                    enable_pol.query,
-                    hostname,
-                    fleetctl,
-                    query_timeout,
-                    deadline_seconds=org_deadline,
-                    expected=False,
-                ):
-                    failures.append("Enable policy still passes after disable profile")
-
-            # Restore base profiles without any org-decision profile.
-            # No polling here — no assertion about the resulting state,
-            # just letting the team settle before the next test.
-            if other_profiles:
-                log_verbose("Restoring base profiles...")
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    other_profiles,
-                )
-                time.sleep(15)
-
-            if failures:
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "; ".join(failures),
-                )
-            return TestResult(cis_id, name, "PASS")
-
-        if plan.test_type == "MANUAL":
-            applied = prompt_manual(policy)
-            if not applied:
-                return TestResult(cis_id, name, "SKIP", "User skipped")
-            time.sleep(5)
-            if not run_query(policy.query, hostname, fleetctl, query_timeout):
-                return TestResult(
-                    cis_id,
-                    name,
-                    "FAIL",
-                    "Query returned no rows after manual remediation",
-                )
-            return TestResult(cis_id, name, "PASS")
-
+        return _execute_test_plan(
+            plan,
+            ip,
+            hostname,
+            fleetctl,
+            query_timeout,
+            pre_profile_passed=pre_profile_passed,
+            team_name=team_name,
+            base_profiles=base_profiles,
+        )
     except subprocess.TimeoutExpired as e:
         return TestResult(cis_id, name, "ERROR", f"Timeout: {e}")
     except Exception as e:
         return TestResult(cis_id, name, "ERROR", str(e))
-
-    return TestResult(cis_id, name, "ERROR", "Unexpected test type")
 
 
 # ---------------------------------------------------------------------------
@@ -1619,306 +1668,476 @@ def print_summary(results: list[TestResult], team: FleetTeam) -> int:
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="""\
+@dataclass
+class _CliOptions:
+    """Parsed command-line options (stdlib-only, no argparse)."""
+
+    macos_version: str = ""
+    all: bool = False
+    cis_ids: str = ""
+    match: str = ""
+    skip_manual: bool = False
+    only_scripts: bool = False
+    only_mdm: bool = False
+    only_manual: bool = False
+    fleet_url: str = ""
+    fleet_token: str = ""
+    fleetctl_context: str = "default"
+    fleetctl_path: str = "./build/fleetctl"
+    pkg_path: str = ""
+    vm_name: str = ""
+    tart_image: str = ""
+    keep_vm: bool = False
+    cleanup: bool = False
+    query_timeout: int = 60
+    boot_timeout: int = 180
+    cis_dir: str = ""
+    verbose: bool = False
+
+
+_USAGE = """\
+usage: cis-test-runner.py --macos-version {13,14,15,26}
+                          (--all | --cis-ids IDS | --match TERMS) [options]
+
 Automated CIS benchmark policy test runner.
 
 Creates a fresh macOS VM using tart, enrolls it in a dedicated Fleet
 team, and runs each selected CIS policy query to verify that the
 osquery SQL correctly detects compliance and non-compliance.
 
-The tool creates a temporary Fleet team with its own enroll secret,
-builds a fleet agent package bound to that team, and installs it in
-the VM. If any selected policies require MDM profiles, the tool
-prompts for interactive MDM enrollment and pushes the profiles to the
-team automatically.
+target:
+  --macos-version {13,14,15,26}
+                        macOS version to test (required). Determines the
+                        tart VM image and the CIS policy directory.
+  --all                 Test every CIS policy in the policy file.
+  --cis-ids IDS         Comma-separated CIS IDs (e.g. '1.1,2.3.3.4').
+  --match TERMS         Comma-separated substrings matched against policy
+                        names (case-insensitive).
+  --skip-manual, --skip-no-script
+                        Skip MANUAL tests instead of prompting.
+  --only-scripts        Only run script-based tests.
+  --only-mdm            Only run MDM-dependent tests.
+  --only-manual         Only run manual tests.
 
-Each policy is tested according to the available test artifacts:
-  - Scripts with _pass and _fail suffixes: verifies both directions
-  - Scripts with just the CIS ID: verifies pass only
-  - MDM profiles with no scripts: verifies fail without profile,
-    then pass after profile delivery
-  - No artifacts: prompts for manual remediation or skips
+fleet connection:
+  --fleet-url URL       Fleet server URL (flag > $FLEET_URL > config).
+  --fleet-token TOKEN   Fleet API token (flag > $FLEET_API_TOKEN > config).
+  --fleetctl-context CTX
+                        fleetctl config context (default: default).
+  --fleetctl-path PATH  Path to fleetctl (default: ./build/fleetctl).
+  --pkg-path PATH       Use a pre-built fleet-osquery.pkg.
 
-After all tests complete, a summary of pass/fail/skip/error is
-printed. Exit code is 0 if all non-skipped tests passed, 1 otherwise.
+VM configuration:
+  --vm-name NAME        tart VM name (default: cis-test-macos-<version>).
+  --tart-image IMAGE    Override the tart base image.
 
-Prerequisites:
-  - tart (brew install cirruslabs/cli/tart)
-  - sshpass (brew install esolitos/ipa/sshpass)
-  - pyyaml (pip3 install pyyaml)
-  - A running Fleet instance with MDM configured
-  - A Fleet API token (Fleet UI > My account, or fleetctl login)
-  - fleetctl built locally (make build from repo root)
+cleanup:
+  --keep-vm             Reuse / keep the VM after the run.
+  --cleanup             Delete the team, host record, and VM afterwards.
 
-Examples:
-  # Test a single benchmark
-  python3 %(prog)s --macos-version 14 --cis-ids 2.3.3.4
+advanced:
+  --query-timeout SECS  fleetctl live query timeout (default: 60).
+  --boot-timeout SECS   VM boot + enrollment timeout (default: 180).
+  --cis-dir PATH        Override the CIS directory path.
+  --verbose             Show detailed output.
+  -h, --help            Show this help and exit.
+"""
 
-  # Test all benchmarks, skip those without scripts or profiles
-  python3 %(prog)s --macos-version 14 --all --skip-manual
 
-  # Test by name, clean up everything after
-  python3 %(prog)s --macos-version 14 --match "Remote Login" --cleanup
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def _print_usage() -> None:
+    """Print the CLI usage/help text."""
+    print(_USAGE)
 
-    # --- Target selection ---
-    target = parser.add_argument_group(
-        "target",
-        "Which macOS version and CIS policies to test. Exactly one of "
-        "--all, --cis-ids, or --match is required.",
-    )
-    target.add_argument(
-        "--macos-version",
-        required=True,
-        choices=list(VERSION_MAP.keys()),
-        help=(
-            "macOS version to test. Determines the tart VM image and "
-            "the CIS policy directory (ee/cis/macos-{version}/)."
-        ),
-    )
 
-    selection = target.add_mutually_exclusive_group(required=True)
-    selection.add_argument(
-        "--all",
-        action="store_true",
-        help="Test every CIS policy in the policy file.",
-    )
-    selection.add_argument(
-        "--cis-ids",
-        metavar="IDS",
-        help=(
-            "Comma-separated list of CIS IDs to test "
-            "(e.g., '1.1,2.3.3.4,5.2.3'). Matches against the cis_id "
-            "field in the policy YAML."
-        ),
-    )
-    selection.add_argument(
-        "--match",
-        metavar="TERMS",
-        help=(
-            "Comma-separated substrings to match against policy names "
-            "(e.g., 'Remote Login,AirDrop'). Case-insensitive."
-        ),
-    )
-    target.add_argument(
-        "--skip-manual",
-        "--skip-no-script",
-        dest="skip_manual",
-        action="store_true",
-        help=(
-            "Skip MANUAL-type tests (policies with no automation) "
-            "instead of prompting the user to perform the steps. "
-            "MDM profile tests and org-decision tests still run. "
-            "(--skip-no-script is kept as a deprecated alias.)"
-        ),
-    )
+def _die_usage(msg: str) -> NoReturn:
+    """Print an error plus usage and exit with code 2 (argparse parity)."""
+    log_error(msg)
+    _print_usage()
+    raise SystemExit(2)
 
-    type_filter = target.add_mutually_exclusive_group()
-    type_filter.add_argument(
-        "--only-scripts",
-        action="store_true",
-        help=(
-            "Only run script-based tests (PASS_FAIL and PASS_ONLY). "
-            "Skip MDM profile tests, org-decision tests, and manual "
-            "prompts. Useful for running a fast, fully-automated subset."
-        ),
-    )
-    type_filter.add_argument(
-        "--only-mdm",
-        action="store_true",
-        help=(
-            "Only run MDM-dependent tests (PROFILE and ORG_DECISION). "
-            "Skip script-based and manual tests. Useful when validating "
-            "MDM profile delivery."
-        ),
-    )
-    type_filter.add_argument(
-        "--only-manual",
-        action="store_true",
-        help=(
-            "Only run tests that require manual user interaction "
-            "(MANUAL). Skip all automated tests. Useful for walking "
-            "through the checks that can't be scripted."
-        ),
-    )
 
-    # --- Fleet connection ---
-    fleet = parser.add_argument_group(
-        "fleet connection",
-        "How to connect to the Fleet server. The tool creates a "
-        "temporary team and builds a fleet agent bound to it. "
-        "By default, the URL and token are read from the fleetctl "
-        "config file (~/.fleet/config) so that a logged-in fleetctl "
-        "session works with no extra flags. Use --fleet-url and "
-        "--fleet-token to override, or set FLEET_URL and "
-        "FLEET_API_TOKEN environment variables.",
-    )
-    fleet.add_argument(
-        "--fleet-url",
-        default="",
-        metavar="URL",
-        help=(
-            "Fleet server URL (e.g., https://fleet.example.com). "
-            "Resolution order: this flag, then $FLEET_URL, then the "
-            "address from the fleetctl config file."
-        ),
-    )
-    fleet.add_argument(
-        "--fleet-token",
-        default="",
-        metavar="TOKEN",
-        help=(
-            "Fleet API token for authenticated API calls (team "
-            "creation, host lookup, profile push, cleanup). "
-            "Resolution order: this flag, then $FLEET_API_TOKEN, then "
-            "the token from the fleetctl config file. To populate the "
-            "config file, run: fleetctl login"
-        ),
-    )
-    fleet.add_argument(
-        "--fleetctl-context",
-        default="default",
-        metavar="CTX",
-        help=(
-            "Name of the fleetctl config context to read credentials "
-            "from when --fleet-url or --fleet-token are not provided. "
-            "(default: default)"
-        ),
-    )
-    fleet.add_argument(
-        "--fleetctl-path",
-        default="./build/fleetctl",
-        metavar="PATH",
-        help=(
-            "Path to the fleetctl binary. Used to build the agent "
-            "package, apply team configurations, and run live queries. "
-            "(default: ./build/fleetctl)"
-        ),
-    )
-    fleet.add_argument(
-        "--pkg-path",
-        metavar="PATH",
-        help=(
-            "Path to a pre-built fleet-osquery.pkg. If provided, "
-            "skips building a new package. WARNING: the pre-built "
-            "package contains a baked-in enroll secret that may not "
-            "match the test team this tool creates. The VM may enroll "
-            "into a different team or fail to enroll. Only use this "
-            "if you know the package was built with the correct secret."
-        ),
-    )
+def _parse_int_flag(flag: str, value: str) -> int:
+    """Parse an integer flag value or exit with a usage error."""
+    try:
+        return int(value)
+    except ValueError:
+        _die_usage(f"argument {flag}: invalid int value: {value!r}")
 
-    # --- VM configuration ---
-    vm = parser.add_argument_group(
-        "VM configuration",
-        "Control the tart VM used for testing.",
-    )
-    vm.add_argument(
-        "--vm-name",
-        default="",
-        metavar="NAME",
-        help=(
-            "Name for the tart VM. If a VM with this name already "
-            "exists, it will be deleted and recreated. "
-            "(default: cis-test-macos-{version})"
-        ),
-    )
-    vm.add_argument(
-        "--tart-image",
-        default="",
-        metavar="IMAGE",
-        help=(
-            "Override the tart base image. By default, the image is "
-            "chosen based on --macos-version: "
-            "13=ghcr.io/cirruslabs/macos-ventura-base:latest, "
-            "14=ghcr.io/cirruslabs/macos-sonoma-base:latest, "
-            "15=ghcr.io/cirruslabs/macos-sequoia-base:latest, "
-            "26=ghcr.io/cirruslabs/macos-tahoe-base:latest."
-        ),
-    )
 
-    # --- Cleanup ---
-    cleanup = parser.add_argument_group(
-        "cleanup",
-        "Control what happens after the test run completes.",
+def _validate_cli(opts: _CliOptions) -> None:
+    """Enforce the argparse contract: required and mutually exclusive flags."""
+    if not opts.macos_version:
+        _die_usage("the following argument is required: --macos-version")
+    if opts.macos_version not in VERSION_MAP:
+        _die_usage(
+            f"argument --macos-version: invalid choice: {opts.macos_version!r} "
+            f"(choose from {', '.join(sorted(VERSION_MAP))})",
+        )
+    selected = sum(bool(x) for x in (opts.all, opts.cis_ids, opts.match))
+    if selected != 1:
+        _die_usage("exactly one of --all, --cis-ids, or --match is required")
+    only_count = sum(
+        bool(x) for x in (opts.only_scripts, opts.only_mdm, opts.only_manual)
     )
-    cleanup.add_argument(
-        "--keep-vm",
-        action="store_true",
-        help=(
-            "Do not delete the tart VM after the run, and reuse it "
-            "on subsequent runs. If a VM with the same name already "
-            "exists and is reachable, the tool skips creation and "
-            "enrollment entirely, saving several minutes. Useful for "
-            "iterating on tests. By default the VM is deleted when "
-            "tests finish."
-        ),
-    )
-    cleanup.add_argument(
-        "--cleanup",
-        action="store_true",
-        help=(
-            "Delete the Fleet team, the enrolled host record, and the "
-            "tart VM after the run. Without this flag, the team and "
-            "host remain in Fleet for inspection (the VM is still "
-            "deleted unless --keep-vm is also set)."
-        ),
-    )
+    if only_count > 1:
+        _die_usage(
+            "--only-scripts, --only-mdm and --only-manual are mutually exclusive",
+        )
 
-    # --- Timeouts and paths ---
-    advanced = parser.add_argument_group("advanced")
-    advanced.add_argument(
-        "--query-timeout",
-        type=int,
-        default=60,
-        metavar="SECS",
-        help=(
-            "Timeout in seconds for each fleetctl live query. "
-            "Increase if queries are slow to return. (default: 60)"
-        ),
-    )
-    advanced.add_argument(
-        "--boot-timeout",
-        type=int,
-        default=180,
-        metavar="SECS",
-        help=(
-            "Timeout in seconds for the VM to boot, get an IP, and "
-            "complete fleet enrollment. Increase for slow networks "
-            "or large VM images. (default: 180)"
-        ),
-    )
-    advanced.add_argument(
-        "--cis-dir",
-        default="",
-        metavar="PATH",
-        help=(
-            "Override the CIS directory path. By default, resolved "
-            "from the repo root as ee/cis/macos-{version}/. Use this "
-            "if running from outside the repo or testing a custom "
-            "policy set."
-        ),
-    )
-    advanced.add_argument(
-        "--verbose",
-        action="store_true",
-        help=(
-            "Show detailed output including SSH commands, query "
-            "results, and script output."
-        ),
-    )
 
-    return parser.parse_args()
+def _parse_cli(argv: list[str]) -> _CliOptions:
+    """Parse CLI args into _CliOptions (stdlib-only, zero argparse).
+
+    NOTE (multi-agent): argparse is a banned API (TID251) in this lane, so
+    the parse is a minimal manual loop in the style of
+    scripts/legado/argocd/app-verify-converged.py. It preserves the exact
+    argparse contract: --macos-version is required and must be in
+    VERSION_MAP, exactly one of --all/--cis-ids/--match, and the --only-*
+    filters are mutually exclusive (bead cosmos-main-jmg3).
+    """
+    opts = _CliOptions()
+    bool_flags = {
+        "--all": "all",
+        "--skip-manual": "skip_manual",
+        "--skip-no-script": "skip_manual",
+        "--only-scripts": "only_scripts",
+        "--only-mdm": "only_mdm",
+        "--only-manual": "only_manual",
+        "--keep-vm": "keep_vm",
+        "--cleanup": "cleanup",
+        "--verbose": "verbose",
+    }
+    # flag -> (attribute, is_int)
+    value_flags = {
+        "--macos-version": ("macos_version", False),
+        "--cis-ids": ("cis_ids", False),
+        "--match": ("match", False),
+        "--fleet-url": ("fleet_url", False),
+        "--fleet-token": ("fleet_token", False),
+        "--fleetctl-context": ("fleetctl_context", False),
+        "--fleetctl-path": ("fleetctl_path", False),
+        "--pkg-path": ("pkg_path", False),
+        "--vm-name": ("vm_name", False),
+        "--tart-image": ("tart_image", False),
+        "--cis-dir": ("cis_dir", False),
+        "--query-timeout": ("query_timeout", True),
+        "--boot-timeout": ("boot_timeout", True),
+    }
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in {"-h", "--help"}:
+            _print_usage()
+            raise SystemExit(0)
+        if arg in bool_flags:
+            setattr(opts, bool_flags[arg], True)
+            index += 1
+            continue
+        if arg in value_flags:
+            attr, is_int = value_flags[arg]
+            if index + 1 >= len(argv):
+                _die_usage(f"argument {arg}: expected one value")
+            value = argv[index + 1]
+            setattr(opts, attr, _parse_int_flag(arg, value) if is_int else value)
+            index += 2
+            continue
+        _die_usage(f"unrecognized argument: {arg}")
+    _validate_cli(opts)
+    return opts
+
+
+def _execute_test_run(
+    args: _CliOptions,
+    fleet_url: str,
+    fleet_token: str,
+    fleetctl: str,
+    vm_name: str,
+    tart_image: str,
+    team: FleetTeam,
+    active_plans: list[TestPlan],
+    any_needs_mdm: bool,
+    results: list[TestResult],
+) -> subprocess.Popen | None:
+    """Run VM setup, enrollment, MDM/profile delivery, and the test loop.
+
+    Split out of main to keep its try clause small (PLW0717). ``team`` and
+    ``results`` are mutated in place; returns the VM process (or None) so
+    main's finally block can clean up. Raises SystemExit(1) on a fatal
+    setup error (e.g. a missing --pkg-path file).
+    """
+    vm_proc: subprocess.Popen | None = None
+    # Phase 3 & 4: VM setup and enrollment
+    #
+    # If --keep-vm is set and the VM already exists and is
+    # reachable, reuse it instead of creating a new one. This
+    # skips agent install and enrollment, saving several minutes.
+    reused_vm = False
+    needs_agent_install = True
+
+    if args.keep_vm and (vm_is_running(vm_name) or vm_exists(vm_name)):
+        if vm_is_running(vm_name):
+            log(f"Attempting to reuse running VM: {vm_name}")
+            ip = wait_for_ip(vm_name, timeout=30)
+        else:
+            log(f"Starting existing VM: {vm_name}")
+            vm_proc = start_vm(vm_name)
+            ip = wait_for_ip(vm_name, timeout=args.boot_timeout)
+
+        # Check if SSH is reachable. If not (e.g., a previous test
+        # disabled SSH), we must destroy and recreate the VM.
+        try:
+            wait_for_ssh(ip, timeout=30)
+        except TimeoutError:
+            log(
+                "SSH unreachable on existing VM (a previous test "
+                "may have disabled it). Recreating VM...",
+            )
+            delete_vm(vm_name)
+            # Fall through to the fresh-VM path below
+            args.keep_vm = False  # force fresh creation this run
+        else:
+            reused_vm = True
+            if not vm_proc:
+                vm_proc = None  # not managed by us
+
+            hostname = get_hostname(ip)
+            team.hostname = hostname
+            log(f"VM hostname: {hostname}")
+
+            # Check if the agent is installed and the host is in Fleet
+            result = ssh(ip, "cat /opt/orbit/identifier 2>/dev/null", timeout=10)
+            has_identifier = result.returncode == 0 and result.stdout.strip()
+            host_info = (
+                get_host_by_hostname(fleet_url, fleet_token, hostname)
+                if has_identifier
+                else None
+            )
+
+            if host_info:
+                identifier = result.stdout.strip()
+                team.host_id = host_info.get("id")
+                log(f"Fleet host ID: {team.host_id}")
+                log("Host found in Fleet, skipping agent install")
+                needs_agent_install = False
+            else:
+                log(
+                    "Host not found in Fleet — will re-install agent "
+                    "to enroll in the test team",
+                )
+
+    if not reused_vm:
+        # Fresh VM: create it first
+        if args.pkg_path:
+            pkg_path = Path(args.pkg_path)
+            if not pkg_path.exists():
+                log_error(f"Package not found: {pkg_path}")
+                raise SystemExit(1)
+            log(
+                "WARNING: Using pre-built package. The VM will enroll "
+                "with whatever secret was baked into this package, which "
+                "may not match the test team. If the host does not appear "
+                "in the test team, rebuild without --pkg-path.",
+            )
+        else:
+            pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
+
+        create_vm(vm_name, tart_image)
+        vm_proc = start_vm(vm_name)
+
+        log("Waiting for VM to boot...")
+        ip = wait_for_ip(vm_name, timeout=args.boot_timeout)
+        wait_for_ssh(ip, timeout=60)
+
+        hostname = get_hostname(ip)
+        team.hostname = hostname
+        log(f"VM hostname: {hostname}")
+
+    # Install agent if needed (fresh VM or reused VM without valid enrollment)
+    if needs_agent_install:
+        if not reused_vm:
+            # pkg already built above for fresh VMs
+            pass
+        # Reused VM needs a new agent to enroll in the test team
+        elif args.pkg_path:
+            pkg_path = Path(args.pkg_path)
+        else:
+            pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
+
+        install_agent(ip, pkg_path)
+        identifier = wait_for_identifier(ip, timeout=args.boot_timeout)
+        wait_for_fleet_registration(
+            fleet_url,
+            identifier,
+            timeout=args.boot_timeout,
+        )
+
+        # Look up host ID in Fleet
+        time.sleep(10)  # Give Fleet a moment to index the host
+        host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
+        if host_info:
+            team.host_id = host_info.get("id")
+            log(f"Fleet host ID: {team.host_id}")
+
+    # Validate the host landed in the correct team; if not,
+    # transfer it. This happens when the VM was previously
+    # enrolled with a different secret (e.g., --keep-vm with a
+    # host that's already MDM-enrolled from a prior run).
+    if team.host_id and team.team_id:
+        host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
+        if host_info:
+            host_team_id = host_info.get("team_id") or host_info.get("fleet_id")
+            if host_team_id == team.team_id:
+                log(f"Host is in the correct team (ID: {team.team_id})")
+            else:
+                current = f"team {host_team_id}" if host_team_id else "no team"
+                log(
+                    f"Host is in {current}, expected {team.team_id} "
+                    f"({team.name}). Transferring...",
+                )
+                try:
+                    transfer_host_to_team(
+                        fleet_url,
+                        fleet_token,
+                        team.host_id,
+                        team.team_id,
+                    )
+                    log(f"Host transferred to team {team.team_id}")
+                except requests.HTTPError:
+                    log_error(
+                        "Failed to transfer host. Profile-based tests will fail.",
+                    )
+
+    # Phase 5: MDM enrollment and profile delivery
+    pre_profile_passed = set()
+    if any_needs_mdm:
+        # Check if the host is already MDM-enrolled; if so, skip
+        # the interactive enrollment step. Poll a few times since
+        # Fleet may take a moment to refresh MDM status after
+        # an agent re-install.
+        already_mdm = False
+        for attempt in range(MDM_STATUS_CHECK_ATTEMPTS):
+            host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
+            mdm = (host_info or {}).get("mdm", {}) or {}
+            mdm_status = mdm.get("enrollment_status")
+            if mdm_status and "On" in str(mdm_status) and mdm.get("connected_to_fleet"):
+                already_mdm = True
+                log(
+                    f"Host already MDM-enrolled ({mdm_status}), "
+                    "skipping MDM enrollment prompt",
+                )
+                break
+            if attempt < MDM_STATUS_CHECK_ATTEMPTS - 1:
+                log_verbose(
+                    f"MDM status check {attempt + 1}/{MDM_STATUS_CHECK_ATTEMPTS}: {mdm_status!r}, retrying...",
+                )
+                time.sleep(5)
+
+        if not already_mdm:
+            enroll_mdm(ip, fleet_url, identifier)
+
+        # Before pushing profiles, verify that profile-only
+        # policies currently fail (no profiles installed yet).
+        # This confirms the query can actually detect non-compliance.
+        #
+        # First, clear the team's profile list and wait for the
+        # host to process the removal. This avoids stale data from
+        # prior test runs causing the pre-profile check to report
+        # "already passes" for policies whose values still linger
+        # in managed_policies.
+        profile_plans = [p for p in active_plans if p.test_type == "PROFILE"]
+        pre_profile_passed = set()
+        if profile_plans:
+            log("Clearing team profiles to get a clean baseline...")
+            push_profiles_to_team(fleetctl, team.name, [])
+            time.sleep(20)  # Wait for the host to process removal
+
+            log(
+                f"Verifying {len(profile_plans)} profile-only queries fail before delivery...",
+            )
+            for plan in profile_plans:
+                passes = run_query(
+                    plan.policy.query,
+                    hostname,
+                    fleetctl,
+                    args.query_timeout,
+                )
+                if passes:
+                    pre_profile_passed.add(plan.policy.cis_id)
+                    log(
+                        f"  [!] CIS {plan.policy.cis_id}: already passes (may not detect non-compliance)",
+                    )
+                else:
+                    log(f"  [ok] CIS {plan.policy.cis_id}: fails as expected")
+            log(
+                f"Pre-profile check complete: "
+                f"{len(profile_plans) - len(pre_profile_passed)} fail as expected, "
+                f"{len(pre_profile_passed)} already pass",
+            )
+
+        # Collect profiles needed by PROFILE plans (tested by
+        # presence during the test). Exclusions:
+        #   - ORG_DECISION: toggles its own enable/disable profiles
+        #   - PASS_FAIL with MDM: toggles its own profile
+        #   - MANUAL: includes quarantined plans
+        #     (SSH_BREAKING_CIS_IDS, PASSWORD_POLICY_CIS_IDS,
+        #     NON_AUTOMATABLE_CIS_IDS) whose mobileconfigs must
+        #     NOT be bulk-pushed. Password-policy profiles break
+        #     VM SSH auth; the Siri/iCloud profiles cause cross-
+        #     test state pollution; 2.6.3 uses wrong keys. These
+        #     profiles are discovered by _discover_profiles() but
+        #     deliberately kept out of the bulk push.
+        all_profiles = []
+        for plan in active_plans:
+            if plan.test_type == "ORG_DECISION":
+                continue
+            if (
+                plan.test_type == "PASS_FAIL"
+                and plan.policy.needs_mdm
+                and plan.profiles
+            ):
+                continue
+            if plan.test_type == "MANUAL":
+                continue
+            all_profiles.extend(plan.profiles)
+        base_profiles = list({str(p): p for p in all_profiles}.values())
+        if base_profiles:
+            push_profiles_to_team(
+                fleetctl,
+                team.name,
+                base_profiles,
+            )
+            log("Waiting for profiles to be delivered...")
+            time.sleep(30)
+    else:
+        base_profiles = []
+
+    # Phase 6: Test execution
+    log(f"Running {len(active_plans)} test(s)...")
+    for plan in active_plans:
+        result = run_test(
+            plan,
+            ip,
+            hostname,
+            fleetctl,
+            args.query_timeout,
+            pre_profile_passed=pre_profile_passed,
+            team_name=team.name,
+            base_profiles=base_profiles,
+        )
+        results.append(result)
+        status_symbol = {"PASS": "+", "FAIL": "x", "SKIP": "-", "ERROR": "!"}.get(
+            result.status,
+            "?",
+        )
+        log(f"  [{status_symbol}] CIS {result.cis_id}: {result.status}")
+
+    return vm_proc
 
 
 def main() -> int:
-    global VERBOSE
-    args = parse_args()
-    VERBOSE = args.verbose
+    """Run the full CIS test pipeline and return the process exit code."""
+    args = _parse_cli(sys.argv[1:])
+    _FLAGS.verbose = args.verbose
 
     # Resolve Fleet URL and token: flag -> env var -> fleetctl config
     fleetctl_config = read_fleetctl_config(args.fleetctl_context)
@@ -1961,15 +2180,19 @@ def main() -> int:
     log("Verifying Fleet API token...")
     try:
         fleet_api(fleet_url, fleet_token, "GET", "/api/v1/fleet/me")
-    except (HTTPError, URLError) as e:
-        status = getattr(e, "code", None)
-        if status == 401:
+    except requests.HTTPError as e:
+        response = e.response
+        status = response.status_code if response is not None else None
+        if status == HTTPStatus.UNAUTHORIZED:
             log_error(
                 "Fleet API token is invalid or expired. "
                 "Please re-authenticate with: fleetctl login",
             )
         else:
             log_error(f"Cannot reach Fleet server at {fleet_url}: {e}")
+        return 1
+    except requests.RequestException as e:
+        log_error(f"Cannot reach Fleet server at {fleet_url}: {e}")
         return 1
 
     # Resolve CIS directory
@@ -1992,7 +2215,10 @@ def main() -> int:
 
     # Check prerequisites
     for tool in ["tart", "sshpass"]:
-        if subprocess.run(["which", tool], capture_output=True).returncode != 0:
+        if (
+            subprocess.run(["which", tool], capture_output=True, check=False).returncode
+            != 0
+        ):
             log_error(f"Required tool not found: {tool}. Install it first.")
             return 1
 
@@ -2086,7 +2312,7 @@ def main() -> int:
     enroll_secret = str(uuid.uuid4())
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     team_name = f"CIS-Test-macOS-{args.macos_version}-{timestamp}"
-    team = create_fleet_team(fleet_url, fleet_token, fleetctl, team_name, enroll_secret)
+    team = create_fleet_team(fleetctl, team_name, enroll_secret)
 
     vm_proc = None
     results = list(skip_results)
@@ -2097,287 +2323,24 @@ def main() -> int:
     fatal_exit_code = 0
 
     try:
-        # Phase 3 & 4: VM setup and enrollment
-        #
-        # If --keep-vm is set and the VM already exists and is
-        # reachable, reuse it instead of creating a new one. This
-        # skips agent install and enrollment, saving several minutes.
-        reused_vm = False
-        needs_agent_install = True
-
-        if args.keep_vm and (vm_is_running(vm_name) or vm_exists(vm_name)):
-            if vm_is_running(vm_name):
-                log(f"Attempting to reuse running VM: {vm_name}")
-                ip = wait_for_ip(vm_name, timeout=30)
-            else:
-                log(f"Starting existing VM: {vm_name}")
-                vm_proc = start_vm(vm_name)
-                ip = wait_for_ip(vm_name, timeout=args.boot_timeout)
-
-            # Check if SSH is reachable. If not (e.g., a previous test
-            # disabled SSH), we must destroy and recreate the VM.
-            try:
-                wait_for_ssh(ip, timeout=30)
-            except TimeoutError:
-                log(
-                    "SSH unreachable on existing VM (a previous test "
-                    "may have disabled it). Recreating VM...",
-                )
-                delete_vm(vm_name)
-                # Fall through to the fresh-VM path below
-                args.keep_vm = False  # force fresh creation this run
-            else:
-                reused_vm = True
-                if not vm_proc:
-                    vm_proc = None  # not managed by us
-
-                hostname = get_hostname(ip)
-                team.hostname = hostname
-                log(f"VM hostname: {hostname}")
-
-                # Check if the agent is installed and the host is in Fleet
-                result = ssh(ip, "cat /opt/orbit/identifier 2>/dev/null", timeout=10)
-                has_identifier = result.returncode == 0 and result.stdout.strip()
-                host_info = (
-                    get_host_by_hostname(fleet_url, fleet_token, hostname)
-                    if has_identifier
-                    else None
-                )
-
-                if host_info:
-                    identifier = result.stdout.strip()
-                    team.host_id = host_info.get("id")
-                    log(f"Fleet host ID: {team.host_id}")
-                    log("Host found in Fleet, skipping agent install")
-                    needs_agent_install = False
-                else:
-                    log(
-                        "Host not found in Fleet — will re-install agent "
-                        "to enroll in the test team",
-                    )
-
-        if not reused_vm:
-            # Fresh VM: create it first
-            if args.pkg_path:
-                pkg_path = Path(args.pkg_path)
-                if not pkg_path.exists():
-                    log_error(f"Package not found: {pkg_path}")
-                    return 1
-                log(
-                    "WARNING: Using pre-built package. The VM will enroll "
-                    "with whatever secret was baked into this package, which "
-                    "may not match the test team. If the host does not appear "
-                    "in the test team, rebuild without --pkg-path.",
-                )
-            else:
-                pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
-
-            create_vm(vm_name, tart_image)
-            vm_proc = start_vm(vm_name)
-
-            log("Waiting for VM to boot...")
-            ip = wait_for_ip(vm_name, timeout=args.boot_timeout)
-            wait_for_ssh(ip, timeout=60)
-
-            hostname = get_hostname(ip)
-            team.hostname = hostname
-            log(f"VM hostname: {hostname}")
-
-        # Install agent if needed (fresh VM or reused VM without valid enrollment)
-        if needs_agent_install:
-            if not reused_vm:
-                # pkg already built above for fresh VMs
-                pass
-            # Reused VM needs a new agent to enroll in the test team
-            elif args.pkg_path:
-                pkg_path = Path(args.pkg_path)
-            else:
-                pkg_path = build_fleet_pkg(fleet_url, team.enroll_secret, fleetctl)
-
-            install_agent(ip, pkg_path)
-            identifier = wait_for_identifier(ip, timeout=args.boot_timeout)
-            wait_for_fleet_registration(
-                fleet_url,
-                identifier,
-                timeout=args.boot_timeout,
-            )
-
-            # Look up host ID in Fleet
-            time.sleep(10)  # Give Fleet a moment to index the host
-            host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
-            if host_info:
-                team.host_id = host_info.get("id")
-                log(f"Fleet host ID: {team.host_id}")
-
-        # Validate the host landed in the correct team; if not,
-        # transfer it. This happens when the VM was previously
-        # enrolled with a different secret (e.g., --keep-vm with a
-        # host that's already MDM-enrolled from a prior run).
-        if team.host_id and team.team_id:
-            host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
-            if host_info:
-                host_team_id = host_info.get("team_id") or host_info.get("fleet_id")
-                if host_team_id == team.team_id:
-                    log(f"Host is in the correct team (ID: {team.team_id})")
-                else:
-                    current = f"team {host_team_id}" if host_team_id else "no team"
-                    log(
-                        f"Host is in {current}, expected {team.team_id} "
-                        f"({team.name}). Transferring...",
-                    )
-                    try:
-                        transfer_host_to_team(
-                            fleet_url,
-                            fleet_token,
-                            team.host_id,
-                            team.team_id,
-                        )
-                        log(f"Host transferred to team {team.team_id}")
-                    except HTTPError:
-                        log_error(
-                            "Failed to transfer host. Profile-based tests will fail.",
-                        )
-
-        # Phase 5: MDM enrollment and profile delivery
-        pre_profile_passed = set()
-        if any_needs_mdm:
-            # Check if the host is already MDM-enrolled; if so, skip
-            # the interactive enrollment step. Poll a few times since
-            # Fleet may take a moment to refresh MDM status after
-            # an agent re-install.
-            already_mdm = False
-            for attempt in range(6):
-                host_info = get_host_by_hostname(fleet_url, fleet_token, hostname)
-                mdm = (host_info or {}).get("mdm", {}) or {}
-                mdm_status = mdm.get("enrollment_status")
-                if (
-                    mdm_status
-                    and "On" in str(mdm_status)
-                    and mdm.get("connected_to_fleet")
-                ):
-                    already_mdm = True
-                    log(
-                        f"Host already MDM-enrolled ({mdm_status}), "
-                        "skipping MDM enrollment prompt",
-                    )
-                    break
-                if attempt < 5:
-                    log_verbose(
-                        f"MDM status check {attempt + 1}/6: {mdm_status!r}, retrying...",
-                    )
-                    time.sleep(5)
-
-            if not already_mdm:
-                enroll_mdm(ip, fleet_url, identifier)
-
-            # Before pushing profiles, verify that profile-only
-            # policies currently fail (no profiles installed yet).
-            # This confirms the query can actually detect non-compliance.
-            #
-            # First, clear the team's profile list and wait for the
-            # host to process the removal. This avoids stale data from
-            # prior test runs causing the pre-profile check to report
-            # "already passes" for policies whose values still linger
-            # in managed_policies.
-            profile_plans = [p for p in active_plans if p.test_type == "PROFILE"]
-            pre_profile_passed = set()
-            if profile_plans:
-                log("Clearing team profiles to get a clean baseline...")
-                push_profiles_to_team(fleet_url, fleet_token, fleetctl, team_name, [])
-                time.sleep(20)  # Wait for the host to process removal
-
-                log(
-                    f"Verifying {len(profile_plans)} profile-only queries fail before delivery...",
-                )
-                for plan in profile_plans:
-                    passes = run_query(
-                        plan.policy.query,
-                        hostname,
-                        fleetctl,
-                        args.query_timeout,
-                    )
-                    if passes:
-                        pre_profile_passed.add(plan.policy.cis_id)
-                        log(
-                            f"  [!] CIS {plan.policy.cis_id}: already passes (may not detect non-compliance)",
-                        )
-                    else:
-                        log(f"  [ok] CIS {plan.policy.cis_id}: fails as expected")
-                log(
-                    f"Pre-profile check complete: "
-                    f"{len(profile_plans) - len(pre_profile_passed)} fail as expected, "
-                    f"{len(pre_profile_passed)} already pass",
-                )
-
-            # Collect profiles needed by PROFILE plans (tested by
-            # presence during the test). Exclusions:
-            #   - ORG_DECISION: toggles its own enable/disable profiles
-            #   - PASS_FAIL with MDM: toggles its own profile
-            #   - MANUAL: includes quarantined plans
-            #     (SSH_BREAKING_CIS_IDS, PASSWORD_POLICY_CIS_IDS,
-            #     NON_AUTOMATABLE_CIS_IDS) whose mobileconfigs must
-            #     NOT be bulk-pushed. Password-policy profiles break
-            #     VM SSH auth; the Siri/iCloud profiles cause cross-
-            #     test state pollution; 2.6.3 uses wrong keys. These
-            #     profiles are discovered by _discover_profiles() but
-            #     deliberately kept out of the bulk push.
-            all_profiles = []
-            for plan in active_plans:
-                if plan.test_type == "ORG_DECISION":
-                    continue
-                if (
-                    plan.test_type == "PASS_FAIL"
-                    and plan.policy.needs_mdm
-                    and plan.profiles
-                ):
-                    continue
-                if plan.test_type == "MANUAL":
-                    continue
-                all_profiles.extend(plan.profiles)
-            base_profiles = list({str(p): p for p in all_profiles}.values())
-            if base_profiles:
-                push_profiles_to_team(
-                    fleet_url,
-                    fleet_token,
-                    fleetctl,
-                    team_name,
-                    base_profiles,
-                )
-                log("Waiting for profiles to be delivered...")
-                time.sleep(30)
-        else:
-            base_profiles = []
-
-        # Phase 6: Test execution
-        log(f"Running {len(active_plans)} test(s)...")
-        for plan in active_plans:
-            result = run_test(
-                plan,
-                ip,
-                hostname,
-                fleetctl,
-                args.query_timeout,
-                pre_profile_passed=pre_profile_passed,
-                fleet_url=fleet_url,
-                fleet_token=fleet_token,
-                team_name=team_name,
-                base_profiles=base_profiles,
-            )
-            results.append(result)
-            status_symbol = {"PASS": "+", "FAIL": "x", "SKIP": "-", "ERROR": "!"}.get(
-                result.status,
-                "?",
-            )
-            log(f"  [{status_symbol}] CIS {result.cis_id}: {result.status}")
-
+        vm_proc = _execute_test_run(
+            args,
+            fleet_url,
+            fleet_token,
+            fleetctl,
+            vm_name,
+            tart_image,
+            team,
+            active_plans,
+            any_needs_mdm,
+            results,
+        )
     except KeyboardInterrupt:
         log("\nInterrupted by user")
         fatal_exit_code = 130
     except Exception as e:
         log_error(f"Fatal error: {e}")
-        if VERBOSE:
-            import traceback
-
+        if _FLAGS.verbose:
             traceback.print_exc()
         fatal_exit_code = 1
     finally:
