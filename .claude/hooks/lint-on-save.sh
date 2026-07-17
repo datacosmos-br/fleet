@@ -1,84 +1,65 @@
 #!/bin/sh
-# PostToolUse hook: auto-fix lint issues, then report anything remaining
-# Uses the project's own make lint-go-incremental (only checks changes since branching from main)
-# Runs after formatters (goimports, prettier) so it only sees convention violations
+# PostToolUse hook: validate the edited source without mutating it.
+set -eu
 
 INPUT=$(cat)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty')
+[ -n "$FILE_PATH" ] || exit 0
 
-if [ -z "$FILE_PATH" ]; then
-  exit 0
+PROJECT_DIR=${CLAUDE_PROJECT_DIR:-}
+if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
+  printf 'lint-on-save: CLAUDE_PROJECT_DIR is required and must exist\n' >&2
+  exit 2
 fi
-
-# Need to be in the project root for make targets
-PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
-if [ -z "$PROJECT_DIR" ]; then
-  PROJECT_DIR="$CLAUDE_PROJECT_DIR"
-fi
-if [ -n "$PROJECT_DIR" ]; then
-  cd "$PROJECT_DIR" || exit 0
-fi
-
-TMPFILE=$(mktemp)
-trap 'rm -f "$TMPFILE"' EXIT
 
 case "$FILE_PATH" in
-  *.go)
-    # Skip third_party (with or without leading path)
-    case "$FILE_PATH" in
-      third_party/*|*/third_party/*) exit 0 ;;
-    esac
-
-    # First pass: auto-fix what we can (uses golangci-lint directly for --fix)
-    PKG_DIR=$(dirname "$FILE_PATH")
-    if command -v golangci-lint >/dev/null 2>&1; then
-      golangci-lint run --fix "$PKG_DIR/..." > /dev/null 2>&1
-    fi
-
-    # Second pass: use project's incremental linter (only changes since branching from main)
-    if [ -f Makefile ] && grep -q "lint-go-incremental" Makefile; then
-      make lint-go-incremental > "$TMPFILE" 2>&1
-    elif command -v golangci-lint >/dev/null 2>&1; then
-      # Fallback if make target isn't available
-      golangci-lint run "$PKG_DIR/..." > "$TMPFILE" 2>&1
-    else
-      exit 0
-    fi
-
-    # Filter out noise (level=warning, command echo, summary) and keep only real violations
-    # Real violations look like: path/to/file.go:LINE:COL: message (lintername)
-    VIOLATIONS=$(grep -v "^level=" "$TMPFILE" | grep -v "^\\./" | grep -v "^[0-9]* issues" | grep -v "^$" | grep -E '\.go:[0-9]+:[0-9]+:' | head -20)
-
-    if [ -n "$VIOLATIONS" ]; then
-      echo "$VIOLATIONS" | jq -Rsc --arg fp "$FILE_PATH" \
-        '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: ("make lint-go-incremental found issues after editing " + $fp + ":\n" + .)}}'
-    fi
+  "$PROJECT_DIR"/*) TARGET=${FILE_PATH#"$PROJECT_DIR"/} ;;
+  /*)
+    printf 'lint-on-save: file is outside project root: %s\n' "$FILE_PATH" >&2
+    exit 2
     ;;
-
-  *.ts|*.tsx)
-    # Determine eslint binary (prefer local, avoid npx auto-install)
-    if [ -x ./node_modules/.bin/eslint ]; then
-      ESLINT="./node_modules/.bin/eslint"
-    elif command -v npx >/dev/null 2>&1 && npx --no-install eslint --version >/dev/null 2>&1; then
-      ESLINT="npx --no-install eslint"
-    else
-      exit 0
-    fi
-
-    if [ -n "$ESLINT" ]; then
-      # First pass: auto-fix
-      $ESLINT --fix "$FILE_PATH" > /dev/null 2>&1
-
-      # Second pass: capture remaining issues (include stderr for config/parser errors)
-      $ESLINT "$FILE_PATH" > "$TMPFILE" 2>&1
-
-      if grep -q "error\|warning\|Error:" "$TMPFILE"; then
-        jq -Rsc --arg fp "$FILE_PATH" \
-          '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: ("ESLint found issues after editing " + $fp + ":\n" + .)}}' \
-          < "$TMPFILE"
-      fi
-    fi
+  *) TARGET=$FILE_PATH ;;
+esac
+case "/$TARGET/" in
+  */../*)
+    printf 'lint-on-save: parent traversal is forbidden: %s\n' "$TARGET" >&2
+    exit 2
     ;;
 esac
 
-exit 0
+cd "$PROJECT_DIR" || exit 2
+
+emit_failure() {
+  label=$1
+  output=$2
+  jq -n --arg fp "$TARGET" --arg label "$label" --arg output "$output" \
+    '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: ($label + " failed for " + $fp + ":\n" + $output)}}'
+}
+
+run_check() {
+  label=$1
+  shift
+  output=""
+  if ! output=$("$@" 2>&1); then
+    emit_failure "$label" "$output"
+    exit 2
+  fi
+}
+
+case "$TARGET" in
+  third_party/*|*/third_party/*) exit 0 ;;
+  *.go)
+    if [ ! -f Makefile ] || ! grep -q '^lint-go-incremental:' Makefile; then
+      printf 'lint-on-save: canonical lint-go-incremental target is missing\n' >&2
+      exit 2
+    fi
+    run_check "make lint-go-incremental" make lint-go-incremental
+    ;;
+  *.ts|*.tsx|*.js|*.jsx)
+    run_check "yarn prettier --check" yarn --silent prettier --check "$TARGET"
+    run_check "yarn eslint" yarn --silent eslint "$TARGET"
+    ;;
+  *.scss|*.css)
+    run_check "yarn prettier --check" yarn --silent prettier --check "$TARGET"
+    ;;
+esac

@@ -10,8 +10,6 @@
   "permissions": {
     "allow": [
       "Read(~/.fleet/claude-projects/**)",
-      "Write(~/.fleet/claude-projects/**)",
-      "Edit(~/.fleet/claude-projects/**)",
       "Bash(go test*)",
       "Bash(go vet*)",
       "Bash(go build*)",
@@ -20,7 +18,6 @@
       "Bash(golangci-lint *)",
       "Bash(MYSQL_TEST=1 go test*)",
       "Bash(MYSQL_TEST=1 REDIS_TEST=1 go test*)",
-      "Bash(FLEET_INTEGRATION_TESTS_DISABLE_LOG=1 *)",
       "Bash(yarn test*)",
       "Bash(yarn lint*)",
       "Bash(npx prettier*)",
@@ -41,7 +38,6 @@
       "Bash(make run-go-tests*)",
       "Bash(make fleet-dev*)",
       "Bash(make fleetctl-dev*)",
-      "Bash(make clean*)",
       "Bash(make doc*)",
       "Bash(make dump-test-schema*)",
       "Bash(make analyze-go*)",
@@ -61,8 +57,17 @@
     "deny": [
       "Bash(git push --force*)",
       "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean*)",
+      "Bash(git checkout --*)",
+      "Bash(git restore*)",
+      "Bash(git stash*)",
       "Bash(rm -rf /*)",
-      "Bash(rm -rf ~*)"
+      "Bash(rm -rf ~*)",
+      "Bash(chmod 777*)",
+      "Bash(ssh *)",
+      "Bash(* > /dev/*)",
+      "Bash(sudo *)"
     ]
   },
   "hooks": {
@@ -92,18 +97,7 @@
       },
       {
         "matcher": "Edit|Write",
-        "if": "Edit(frontend/**) || Write(frontend/**)",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prettier-frontend.sh",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write",
-        "if": "Edit(**/*.go) || Edit(**/*.ts) || Edit(**/*.tsx) || Write(**/*.go) || Write(**/*.ts) || Write(**/*.tsx)",
+        "if": "Edit(**/*.go) || Edit(**/*.ts) || Edit(**/*.tsx) || Edit(**/*.js) || Edit(**/*.jsx) || Edit(**/*.scss) || Edit(**/*.css) || Write(**/*.go) || Write(**/*.ts) || Write(**/*.tsx) || Write(**/*.js) || Write(**/*.jsx) || Write(**/*.scss) || Write(**/*.css)",
         "hooks": [
           {
             "type": "command",
